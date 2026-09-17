@@ -7,6 +7,7 @@
 #   plots. 
 #
 # Run after step2_imputation_and_modeling.R.
+#
 ################################################################################
 
 
@@ -50,8 +51,6 @@ format_decimal <- function(x, digits = 3) {
   xc <- as.character(xr)
   xc <- ifelse(abs(xr - 0) < 1e-10, "0", xc)
   xc <- ifelse(abs(xr - 1) < 1e-10, "1", xc)
-  xc <- ifelse(!xc %in% c("0","1"), gsub("0+$","",xc), xc)
-  xc <- ifelse(!xc %in% c("0","1"), gsub("\\.$","",xc), xc)
   xc
 }
 
@@ -158,6 +157,51 @@ for (a in analyses) {
   if (length(ss_list)  > 0) all_sens_spec[[an]]  <- bind_rows(ss_list)
   if (length(imp_list) > 0) all_importance[[an]] <- bind_rows(imp_list)
 }
+
+
+###############################################################################
+# 3b - DETECT PARTICIPANTS WITH DEGENERATE MODEL CIs (GLOBAL, ACROSS ANALYSES)
+###############################################################################
+
+cat("\n--- Detecting participants with degenerate CIs ---\n")
+
+# Parse "[lo, hi]" strings into numeric, flag [NA,NA] / [0,1] / [1,1] as degenerate
+parse_ci <- function(x) suppressWarnings(as.numeric(strsplit(gsub("\\[|\\]", "", x), ",\\s*")[[1]]))
+is_bad   <- function(ci) (is.na(ci[1]) && is.na(ci[2])) || isTRUE(all.equal(ci, c(0,1))) || isTRUE(all.equal(ci, c(1,1)))
+
+# Step 1: null out any model (RF, EN/LR, GP, Ensemble) whose own CI is degenerate
+all_summaries <- lapply(all_summaries, function(sm) {
+  pairs <- list(c("RandomForest_AUC","RF_CI"), 
+                c(get_en_col(sm), if("LR_CI" %in% names(sm)) "LR_CI" else "EN_CI"),
+                c("GaussianProcess_AUC","GP_CI"), 
+                c("Ensemble_AUC","Ens_CI"))
+  for (p in pairs) {
+    bad <- sapply(sm[[p[2]]], function(x) is_bad(parse_ci(x)))
+    sm[[p[1]]][bad] <- NA
+    sm[[p[2]]][bad] <- "[NA, NA]"
+  }
+  sm
+})
+
+# Step 2: find participants with zero usable models in ANY config (global)
+auc_cols_by_sm <- lapply(all_summaries, function(sm) c("RandomForest_AUC", get_en_col(sm), "GaussianProcess_AUC", "Ensemble_AUC"))
+drop_ids_degenerate <- unique(unlist(lapply(names(all_summaries), function(an) {
+  sm <- all_summaries[[an]]
+  sm$StudyID[apply(sm[, auc_cols_by_sm[[an]]], 1, function(r) all(is.na(r)))]
+})))
+
+# Step 2b: find participants with only a single held-out observation in ANY
+# config (global)
+drop_ids_single_obs <- unique(unlist(lapply(names(all_summaries), function(an) {
+  sm <- all_summaries[[an]]
+  # remove participants with only one fold (now also filtered out in step2)
+  sm$StudyID[sm$NumObservations == 1]
+})))
+
+drop_ids <- unique(c(drop_ids_degenerate, drop_ids_single_obs))
+
+# Step 3: drop those participants from every config
+all_summaries <- lapply(all_summaries, function(sm) sm %>% filter(!StudyID %in% drop_ids))
 
 
 ###############################################################################
@@ -345,6 +389,14 @@ sm_a4 <- all_summaries[[a4$name]]
 
 if (!is.null(sm_a4) && nrow(sm_a4) > 0) {
   pp  <- .build_three_plots(sm_a4, a4$label)
+  # Drop the chance-line (xintercept = 0.5) baked into .build_three_plots()'s
+  # p_dot
+  pp$p_dot$layers <- Filter(function(l) !(inherits(l$geom, "GeomVline") &&
+                                             isTRUE(all.equal(l$data$xintercept, 0.5))),
+                             pp$p_dot$layers)
+  # Reference line for the null-model comparison (mean AUC = 0.557)
+  pp$p_dot <- pp$p_dot +
+    geom_vline(xintercept = 0.557, linetype = "dashed", color = "grey40", alpha = 0.8)
   p_a4 <- ((pp$p_dot + pp$p_freq + plot_layout(widths = c(2,1))) &
              theme(text = element_text(family = "Arial"))) +
     plot_annotation(tag_levels = "A") &
@@ -526,3 +578,175 @@ for (a in analyses) {
               if (!is.null(sm)) nrow(sm) else 0))
 }
 cat("\nAll outputs written to:", analysis_output_dir, "\n")
+
+
+###############################################################################
+# 11 - A4 LAG-1 PAIN LR COEFFICIENT SIGN (reviewer response)
+###############################################################################
+#
+#   Reports the sign/magnitude of the A4_Lag1PainOnly LR coefficient on
+#   overall_pain_lag1 for every participant, regardless of whether LR was
+#   their best-performing model. Reads the coefficient already fit and saved
+#   by build_a4_result_row() in step2.
+#
+###############################################################################
+
+cat("\n--- A4 lag-1 pain LR coefficient sign ---\n")
+
+sm_a4_lr <- all_summaries[["A4_Lag1PainOnly"]]
+
+if (is.null(sm_a4_lr) || !("Lag1Pain_LR_Estimate" %in% names(sm_a4_lr))) {
+  cat("  A4_Lag1PainOnly summary missing or has no Lag1Pain_LR_Estimate column — skipping\n")
+} else {
+  lr_signs <- sm_a4_lr %>%
+    filter(!is.na(Lag1Pain_LR_Estimate)) %>%
+    transmute(
+      StudyID  = StudyID,
+      Estimate = Lag1Pain_LR_Estimate,
+      SE       = Lag1Pain_LR_SE,
+      CI_Lo    = Lag1Pain_LR_CI_Lo,
+      CI_Hi    = Lag1Pain_LR_CI_Hi,
+      P        = Lag1Pain_LR_P,
+      Sign     = ifelse(Estimate > 0, "Positive", "Negative")
+    )
+
+  sign_summary <- lr_signs %>%
+    count(Sign) %>%
+    mutate(Pct = round(n / sum(n) * 100, 1))
+
+  write_csv(lr_signs,     file.path(analysis_output_dir, "A4_Lag1PainOnly_LR_coefficient_signs.csv"))
+  write_csv(sign_summary, file.path(analysis_output_dir, "A4_Lag1PainOnly_LR_coefficient_sign_summary.csv"))
+
+  cat("  Saved: A4_Lag1PainOnly_LR_coefficient_signs.csv, A4_Lag1PainOnly_LR_coefficient_sign_summary.csv\n")
+  cat("  N with a usable coefficient:", nrow(lr_signs), "/", nrow(sm_a4_lr), "\n")
+  print(sign_summary)
+}
+
+
+###############################################################################
+# 12 - A4 NULL MODEL COMPARISON (permutation test)
+###############################################################################
+#
+#   Reads the per-participant null distributions written by the A4_NullModel
+#   loop and compares them against the real A4_Lag1PainOnly result, for
+#   Best_AUC and each of the four individual model AUCs:
+#     - Individual: each person's real value vs. their own null distribution
+#       (mean/SD/CI), with an empirical one-sided p-value (proportion of that
+#       person's own null draws >= their real value, +1/+1 correction so p
+#       is never exactly 0).
+#     - Group: consolidate each person's null distribution to their own null
+#       mean first, then compare the group's real average against the group
+#       average of those null means via a paired t-test, matching Section 8's
+#       group-level comparisons.
+#
+###############################################################################
+
+cat("\n--- A4 null model comparison ---\n")
+
+a4_null_patient_dir <- file.path(results_dir, "A4_NullModel", "PatientResults")
+sm_a4_real           <- all_summaries[["A4_Lag1PainOnly"]]
+
+null_metric_cols <- c("Best_AUC", "RandomForest_AUC", "LogisticRegression_AUC",
+                      "GaussianProcess_AUC", "Ensemble_AUC")
+
+if (!is.null(sm_a4_real) && "Best_AUC" %in% names(sm_a4_real)) {
+  sm_a4_real$Best_AUC <- apply(sm_a4_real[, get_auc_cols(sm_a4_real)], 1, max, na.rm = TRUE)
+}
+
+if (is.null(sm_a4_real) || !dir.exists(a4_null_patient_dir)) {
+  cat("  A4_Lag1PainOnly summary or A4_NullModel results not found — skipping\n")
+} else {
+
+  # Load each participant's null distribution
+  null_list <- list()
+  for (pid in sm_a4_real$StudyID) {
+    null_file <- file.path(a4_null_patient_dir, pid, paste0(pid, "_null_distribution.csv"))
+    if (file.exists(null_file))
+      null_list[[pid]] <- read_csv(null_file, show_col_types = FALSE) %>%
+        select(any_of(c("Repeat", null_metric_cols))) %>%
+        mutate(StudyID = pid)
+  }
+
+  if (length(null_list) == 0) {
+    cat("  No A4_NullModel distributions found on disk — skipping\n")
+  } else {
+    all_null <- bind_rows(null_list)
+    cat("  Null distributions loaded for", length(unique(all_null$StudyID)), "participants\n")
+
+    empirical_p <- function(observed, null_vals)
+      (sum(null_vals >= observed) + 1) / (length(null_vals) + 1)
+
+    # Individual comparison, one row per participant x metric
+    within_list <- list()
+    for (metric in null_metric_cols) {
+      if (!(metric %in% names(all_null)) || !(metric %in% names(sm_a4_real))) next
+      for (pid in unique(all_null$StudyID)) {
+        real_row <- sm_a4_real %>% filter(StudyID == pid)
+        if (nrow(real_row) == 0) next
+        real_val  <- real_row[[metric]][1]
+        null_vals <- all_null[[metric]][all_null$StudyID == pid]
+        null_vals <- null_vals[!is.na(null_vals)]
+        if (length(null_vals) == 0 || is.na(real_val)) next
+        ci    <- calc_ci(null_vals)
+        p_raw <- empirical_p(real_val, null_vals)
+        within_list[[length(within_list) + 1]] <- data.frame(
+          StudyID     = pid,
+          Metric      = metric,
+          Real_Value  = round(real_val, 3),
+          N_Null      = length(null_vals),
+          Null_Mean   = round(mean(null_vals), 3),
+          Null_SD     = round(sd(null_vals), 3),
+          Null_CI_Lo  = round(ci[1], 3),
+          Null_CI_Hi  = round(ci[2], 3),
+          P_value_raw = p_raw,
+          P_value     = ifelse(p_raw < .001, "<0.001", format_decimal(p_raw, 3))
+        )
+      }
+    }
+    within_participant <- bind_rows(within_list)
+
+    if (nrow(within_participant) > 0) {
+      write_csv(within_participant,
+                file.path(analysis_output_dir, "A4_null_within_participant_comparison.csv"))
+      cat("  Saved: A4_null_within_participant_comparison.csv\n")
+      for (metric in unique(within_participant$Metric)) {
+        sub <- within_participant %>% filter(Metric == metric)
+        cat("   ", metric, "— participants with p <.05:",
+            sum(sub$P_value_raw < .05, na.rm = TRUE), "/", nrow(sub), "\n")
+      }
+    }
+
+    # Group comparison: consolidate by person first (their own null
+    # mean), then paired t-test of Real vs. that consolidated null mean
+    # across participants.
+    group_list <- list()
+    for (metric in unique(within_participant$Metric)) {
+      sub <- within_participant %>% filter(Metric == metric)
+      if (nrow(sub) < 2) next
+      tt  <- t.test(sub$Real_Value, sub$Null_Mean, paired = TRUE)
+      dif <- mean(sub$Real_Value - sub$Null_Mean)
+      n   <- nrow(sub); se <- sd(sub$Real_Value - sub$Null_Mean) / sqrt(n)
+      tc  <- qt(.975, n - 1)
+      group_list[[metric]] <- data.frame(
+        Metric          = metric,
+        N               = n,
+        Real_Group_Mean = round(mean(sub$Real_Value), 3),
+        Null_Group_Mean = round(mean(sub$Null_Mean), 3),
+        Mean_Difference = round(dif, 3),
+        CI_Lower        = round(dif - tc*se, 3),
+        CI_Upper        = round(dif + tc*se, 3),
+        t_statistic     = round(tt$statistic, 2),
+        P_value_raw     = tt$p.value,
+        P_value         = ifelse(tt$p.value < .001, "<0.001", format_decimal(tt$p.value, 3))
+      )
+    }
+    group_comparison <- bind_rows(group_list)
+
+    if (nrow(group_comparison) > 0) {
+      write_csv(group_comparison,
+                file.path(analysis_output_dir, "A4_null_group_average_comparison.csv"))
+      cat("  Saved: A4_null_group_average_comparison.csv\n")
+      print(group_comparison)
+    }
+  }
+}

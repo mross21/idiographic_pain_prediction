@@ -39,6 +39,7 @@ The scripts are organized as a sequential workflow:
      - Lag-1 pain only
    - Fits Random Forest, Elastic Net or Logistic Regression, Gaussian Process, and Ensemble models.
    - Saves participant-level predictions, pooled AUC and classification metrics, feature importance, fold caches, and summary tables.
+   - Runs permuted null distributions for Lag-1 pain only feature configuration.
 
 3. `step3_analysis.R`
    - Reads the participant-level outputs from step 2.
@@ -74,4 +75,4 @@ The intended run order is:
 Supplemental analyses are provided in:
 
 1. `misc_tables.R` (Demographics, predictor missingness)
-2. `sensitivity_analysis_data_window_minimum.R`
+2. `sensitivity_analysis_data_window_minimum.R` (Missingness by AUC, counts of AUC > 0.7/0.8 by feature configuration)

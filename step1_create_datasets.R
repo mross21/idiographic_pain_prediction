@@ -506,21 +506,21 @@ df_ema <- df_ema_weather %>%
 cat("\n  Final EMA lookup rows:", nrow(df_ema),
     "| Participants:", length(unique(df_ema$StudyID)), "\n")
 
-# -- 9d: missingness report - every column in df_ema ------------------------------
-cat("\n  df_ema column missingness:\n")
-ema_missingness <- tibble(
-  Column      = names(df_ema),
-  N_Missing   = sapply(df_ema, function(x) sum(is.na(x))),
-  N_Present   = sapply(df_ema, function(x) sum(!is.na(x))),
-  Missing_Pct = round(sapply(df_ema, function(x) mean(is.na(x)) * 100), 5)
-) %>%
-  arrange(desc(Missing_Pct))
-
-print(ema_missingness, n = nrow(ema_missingness))
-
-write_csv(ema_missingness, file.path(report_dir, "df_ema_missingness.csv"))
-cat("  Missingness report saved to:",
-    file.path(report_dir, "df_ema_missingness.csv"), "\n")
+# # -- 9d: missingness report - every column in df_ema ------------------------------
+# cat("\n  df_ema column missingness:\n")
+# ema_missingness <- tibble(
+#   Column      = names(df_ema),
+#   N_Missing   = sapply(df_ema, function(x) sum(is.na(x))),
+#   N_Present   = sapply(df_ema, function(x) sum(!is.na(x))),
+#   Missing_Pct = round(sapply(df_ema, function(x) mean(is.na(x)) * 100), 5)
+# ) %>%
+#   arrange(desc(Missing_Pct))
+# 
+# print(ema_missingness, n = nrow(ema_missingness))
+# 
+# write_csv(ema_missingness, file.path(report_dir, "df_ema_missingness.csv"))
+# cat("  Missingness report saved to:",
+#     file.path(report_dir, "df_ema_missingness.csv"), "\n")
 
 
 # -- 9e: duplicate EMA filter ------------------------------------------------------

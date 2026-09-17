@@ -1,3 +1,5 @@
 step0_EMA_processing.R
 eligible_ids_local.R
+spineGroup_AUC_comparison.R
 .DS_Store
+.Rhistory

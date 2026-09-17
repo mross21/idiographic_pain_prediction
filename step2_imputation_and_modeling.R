@@ -24,8 +24,9 @@ for (p in pkgs) {
   library(p, character.only = TRUE)
 }
 
-# mice.reuse is sourced locally because it may not be exported by miceadds.
-source("mice.reuse.R")
+mice_reuse_path <- "/Users/f0085f6/Documents/GitHub/idiographic_pain_prediction/"
+# mice.reuse is sourced locally
+source(file.path(mice_reuse_path, "mice.reuse.R"))
 
 
 ###############################################################################
@@ -75,6 +76,11 @@ m_imp <- 5
 # Eligibility is based on 1-hour pre-EMA sensor coverage rather than overall device missingness.
 hr_window_min       <- 26                       # minimum valid HR windows
 sleep_day_min       <- floor(hr_window_min / 5) # minimum EMA days with sleep data
+train_sz            <- 20
+val_sz              <- 10
+test_sz             <- 1
+# EMA minimum is set to be equivalent to 10 folds
+ema_min             <- train_sz + val_sz + test_sz + 9
 analysis_label      <- paste0(hr_window_min, "ValidWindows")
 analysis_output_dir <- file.path(output_dir, analysis_label)
 
@@ -108,10 +114,9 @@ analyses <- list(
        label = "Lag EMA Only"),
   list(name  = "A3_Combined",
        vars  = c(fitbit_vars, lag_ema_vars, context_vars),
-       label = "Fitbit + Lag EMA + Context"),
-  list(name  = "A4_Lag1PainOnly",
-       vars  = "overall_pain_lag1",
-       label = "Lag-1 Pain Only") 
+       label = "Fitbit + Lag EMA + Context")
+  # A4_Lag1PainOnly / A4_NullModel are handled in Section 4B since the predictor
+  # overall_pain_lag1 is not imputed.
 )
 
 if (!dir.exists(analysis_output_dir))
@@ -159,7 +164,7 @@ compute_ema_features <- function(pid, t, sensor_df, window_hours = 1) {
   varSteps        <- var(sGrp$steps,  na.rm = TRUE)
   fbSed  <- sGrp %>% filter(steps == 0)
   sedTime <- sum(as.numeric(diff(fbSed$time_block), units = "mins") == 5) * 5
-  fbAct  <- sGrp %>% filter(steps > 50)
+  fbAct  <- sGrp %>% filter(steps > 50) # average steps/min > 50
   actTime <- sum(as.numeric(diff(fbAct$time_block), units = "mins") == 5) * 5
   sleep_val <- sGrp %>% filter(time_block == max(time_block)) %>%
     pull(totalMinutesAsleep) %>% first_or_na()
@@ -183,7 +188,9 @@ pool_auc_rubins <- function(aucs, ses) {
   SE_Z <- ses / (aucs * (1 - aucs))
   Z_bar <- mean(Z)
   W     <- mean(SE_Z^2)
-  B     <- var(Z)
+  # m == 1: a single estimate, no between-estimate variance to add — total 
+  # variance is just the within-estimate term (For A4 configuration).
+  B     <- if (m > 1) var(Z) else 0
   T_var <- W + (1 + 1/m) * B
   SE    <- sqrt(T_var)
   inv_f <- function(z) 1 / (1 + exp(-z))
@@ -201,7 +208,7 @@ pool_proportion_rubins <- function(vals, ns = NULL) {
   L_bar <- mean(L)
   W     <- if (!is.null(ns)) mean(1 / (ns * vals * (1 - vals))) else
     mean(1 / (50 * vals * (1 - vals)))
-  B     <- var(L)
+  B     <- if (m > 1) var(L) else 0
   T_var <- W + (1 + 1/m) * B
   SE    <- sqrt(T_var)
   inv   <- function(x) 1 / (1 + exp(-x))
@@ -218,7 +225,7 @@ pool_kappa_rubins <- function(kappas, kappa_ses) {
   SE_Z   <- kappa_ses / (1 - kappas^2)
   Z_bar  <- mean(Z)
   W      <- mean(SE_Z^2)
-  B      <- var(Z)
+  B      <- if (m > 1) var(Z) else 0
   T_var  <- W + (1 + 1/m) * B
   SE     <- sqrt(T_var)
   inv_k  <- function(z) (exp(2*z) - 1) / (exp(2*z) + 1)
@@ -230,8 +237,8 @@ pool_kappa_rubins <- function(kappas, kappa_ses) {
        between_var = B)
 }
 
-create_rolling_folds <- function(data, min_train = 20, val_size = 10,
-                                 test_size = 1, expanding = TRUE) {
+create_rolling_folds <- function(data, min_train = train_sz, val_size = val_sz,
+                                 test_size = test_sz, expanding = TRUE) {
   n <- nrow(data)
   folds <- list()
   fc <- 0
@@ -283,18 +290,61 @@ calculate_permutation_importance <- function(model, X_test, y_test,
     else rep(0.5, nrow(X))
   }, error = function(e) rep(0.5, nrow(X)))
   safe_auc <- function(resp, pred) tryCatch(
-    as.numeric(auc(roc(resp, pred, quiet = TRUE))), error = function(e) 0.5)
+    as.numeric(auc(roc(resp, pred, levels = c(0, 1), 
+                       direction = "<", quiet = TRUE))), error = function(e) 0.5)
   base   <- safe_auc(y_test, get_p(model, X_test))
   scores <- setNames(numeric(ncol(X_test)), names(X_test))
   for (feat in names(scores)) {
     pa <- numeric(n_perm)
     for (pp in seq_len(n_perm)) {
-      set.seed(126 + pp); Xp <- X_test; Xp[[feat]] <- sample(Xp[[feat]])
+      set.seed(126 + pp)
+      Xp <- X_test
+      Xp[[feat]] <- sample(Xp[[feat]])
       pa[pp] <- safe_auc(y_test, get_p(model, Xp))
     }
     scores[feat] <- max(0, base - mean(pa))
   }
   scores * 100
+}
+
+calc_metrics_one_imp <- function(obs, pred) {
+  tryCatch({
+    if (length(unique(obs)) < 2 || length(unique(pred)) < 2)
+      return(list(auc=0.5, sens=NA, spec=NA, ppv=NA, npv=NA,
+                  f1=NA, kappa=NA, kappa_se=NA, n=length(obs),
+                  npos=sum(obs==1), nneg=sum(obs==0),
+                  npred_pos=NA, npred_neg=NA))
+    r  <- roc(obs, pred, levels = c(0, 1), direction = "<", quiet = TRUE)
+    co <- coords(r, "best", ret = c("threshold","sensitivity","specificity"),
+                 best.method = "youden")
+    co <- co[1, , drop = FALSE]
+    pc <- ifelse(pred >= co$threshold, 1, 0)
+    TP <- sum(pc==1&obs==1)
+    TN <- sum(pc==0&obs==0)
+    FP <- sum(pc==1&obs==0)
+    FN <- sum(pc==0&obs==1)
+    sens <- ifelse(TP + FN > 0, TP / (TP + FN), NA)
+    spec <- ifelse(TN + FP > 0, TN / (TN + FP), NA)
+    ppv <- ifelse(TP+FP>0, TP/(TP+FP), NA)
+    npv <- ifelse(TN+FN>0, TN/(TN+FN), NA)
+    f1  <- ifelse(!is.na(ppv) && !is.na(sens) && (ppv+sens)>0,
+                  2*ppv*sens/(ppv+sens), NA)
+    n   <- length(obs)
+    py  <- ((TP+FN)/n)*((TP+FP)/n)
+    pn <- ((TN+FP)/n)*((TN+FN)/n)
+    kp  <- ifelse(py+pn<1, ((TP+TN)/n-(py+pn))/(1-(py+pn)), NA)
+    pe      <- py + pn
+    kp_se   <- ifelse(!is.na(kp) && pe < 1,
+                      sqrt(pe * (1 - pe) / (n * (1 - pe)^2)),
+                      NA_real_)
+    list(auc=as.numeric(auc(r)), sens=sens, spec=spec,
+         ppv=ppv, npv=npv, f1=f1, kappa=kp, kappa_se=kp_se,
+         n=n, npos=sum(obs==1), nneg=sum(obs==0),
+         npred_pos=TP+FP, npred_neg=TN+FN)
+  }, error = function(e)
+    list(auc=0.5, sens=NA, spec=NA, ppv=NA, npv=NA,
+         f1=NA, kappa=NA, kappa_se=NA, n=length(obs), npos=NA, nneg=NA,
+         npred_pos=NA, npred_neg=NA))
 }
 
 
@@ -304,36 +354,40 @@ calculate_permutation_importance <- function(model, X_test, y_test,
 
 build_participant_model <- function(pid, predictor_vars, patient_dir,
                                     analysis_name,
-                                    fold_rds_files,
-                                    holdout_rds_file = NULL) {
+                                    fold_rds_files) {
   if (length(fold_rds_files) == 0) {
     message("  Skipping ", pid, ": no fold RDS files")
     return(NULL)
   }
-  
+
   last_fold        <- readRDS(fold_rds_files[[length(fold_rds_files)]])
   last_train       <- convert_predictor_types(last_fold[[1]]$train, predictor_vars)
   cleaned          <- clean_participant_data(last_train, predictor_vars)
   valid_predictors <- cleaned$valid_predictors
   rm(last_fold, last_train)
-  
+
   if (length(valid_predictors) < 1) {
     message("  Skipping ", pid, ": no valid predictors")
     return(NULL)
   }
-  
+
   phash     <- sum(as.numeric(charToRaw(pid)))
   base_seed <- 126 + phash
-  
+
   all_imp_preds <- vector("list", m_imp)
-  stored_models <- vector("list", m_imp)
   for (ii in seq_len(m_imp)) {
     all_imp_preds[[ii]] <- data.frame()
-    stored_models[[ii]] <- list()
   }
-  
-  is_a4 <- (analysis_name == "A4_Lag1PainOnly")
-  
+
+  en_label <- "Elastic Net"
+
+  # Per-fold permutation importance, kept nested by imputation so folds can be
+  # averaged within an imputation first, then imputation-level results pooled.
+  imp_scores_by_model <- setNames(
+    list(vector("list", m_imp), vector("list", m_imp), vector("list", m_imp)),
+    c("Random Forest", en_label, "Gaussian Process")
+  )
+
   for (fi in seq_along(fold_rds_files)) {
     fold_data <- readRDS(fold_rds_files[[fi]])
     
@@ -361,8 +415,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
         X_val   <- X_val[,   !const_v, drop = FALSE]
         X_test  <- X_test[,  !const_v, drop = FALSE]
       }
-      fold_predictors <- names(X_train)
-      
+
       set.seed(base_seed + (imp_idx - 1) * 1000 + fi)
       
       # Inner tuning uses forward-in-time resampling within each participant.
@@ -372,7 +425,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
         initialWindow   = chunk_size,
         horizon         = chunk_size,
         fixedWindow     = FALSE,
-        skip            = 1,
+        skip            = 1, # move forward by 2
         classProbs      = TRUE,
         summaryFunction = twoClassSummary,
         allowParallel   = FALSE
@@ -392,7 +445,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
                     ))),
                     metric    = "ROC", ntree = 200,
                     trControl = inner_cv),
-              timeout = 30, # seconds
+              timeout = 300, # seconds
               onTimeout = "silent"
             ),
             error = function(e) {
@@ -400,8 +453,12 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
               NULL
             }
           )
-          rf_val  <- predict(rf_mod, X_val,  type = "prob")$Yes
-          rf_test <- predict(rf_mod, X_test, type = "prob")$Yes
+          rf_val  <- if (!is.null(rf_mod))
+            predict(rf_mod, X_val,  type = "prob")$Yes else
+              rep(base_prob, nrow(X_val))
+          rf_test <- if (!is.null(rf_mod))
+            predict(rf_mod, X_test, type = "prob")$Yes else
+              rep(base_prob, nrow(X_test))
           
           sc  <- scale(X_train)
           ctr <- attr(sc, "scaled:center")
@@ -411,23 +468,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
           sc  <- as.data.frame(sc)
           
           # Elastic Net
-          en_mod <- if (is_a4) {
-            tryCatch(
-              R.utils::withTimeout(
-                train(x = sc, y = y_train, method = "glm",
-                      metric    = "ROC",
-                      trControl = trainControl(method = "none", classProbs = TRUE,
-                                               summaryFunction = twoClassSummary),
-                      family    = "binomial"),
-                timeout = 30, # seconds
-                onTimeout = "silent"
-              ),
-              error = function(e) {
-                message("LR model failed or timed out: ", conditionMessage(e))
-                NULL
-              }
-            )
-          } else if (all(table(y_train) >= 8)) {
+          en_mod <- if (all(table(y_train) >= 8)) {
             tryCatch(
               R.utils::withTimeout(
                 train(x = as.matrix(sc), y = y_train, method = "glmnet",
@@ -435,7 +476,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
                                               lambda = c(0.01, 0.1, 1.0)),
                       metric    = "ROC",
                       trControl = inner_cv),
-                timeout = 30, # seconds
+                timeout = 300, # seconds
                 onTimeout = "silent"
               ),
               error = function(e) {
@@ -447,8 +488,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
           
           predict_en <- function(Xs) {
             if (is.null(en_mod)) return(rep(base_prob, nrow(Xs)))
-            if (is_a4) predict(en_mod, Xs,             type = "prob")$Yes
-            else       predict(en_mod, as.matrix(Xs), type = "prob")$Yes
+            predict(en_mod, as.matrix(Xs), type = "prob")$Yes
           }
           en_val  <- predict_en(Xvs)
           en_test <- predict_en(Xts)
@@ -462,7 +502,7 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
                       sigma_est[1], sigma_est[2], sigma_est[3])),
                     metric    = "ROC",
                     trControl = inner_cv),
-              timeout = 30, # seconds
+              timeout = 300, # seconds
               onTimeout = "silent"
             ),
             error = function(e) {
@@ -477,9 +517,26 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
           gp_test <- if (!is.null(gp_mod))
             predict(gp_mod, Xts, type = "prob")$Yes else
               rep(base_prob, nrow(X_test))
-          
-          # Ensemble
+
           meta_y <- as.numeric(y_val == "Yes")
+
+          # Permutation importance for this fold, scored on this fold's own
+          # validation split.
+          has_both_classes <- length(unique(meta_y)) >= 2 && nrow(X_val) >= 2
+
+          imp_rf <- if (has_both_classes && !is.null(rf_mod))
+            tryCatch(calculate_permutation_importance(rf_mod, X_val, meta_y, type = "rf"),
+                     error = function(e) NULL) else NULL
+
+          imp_en <- if (has_both_classes && !is.null(en_mod))
+            tryCatch(calculate_permutation_importance(en_mod, Xvs, meta_y, type = "glmnet"),
+                     error = function(e) NULL) else NULL
+
+          imp_gp <- if (has_both_classes && !is.null(gp_mod))
+            tryCatch(calculate_permutation_importance(gp_mod, Xvs, meta_y, type = "gp"),
+                     error = function(e) NULL) else NULL
+
+          # Ensemble
           meta_X <- data.frame(RF = rf_val, EN = en_val, GP = gp_val)
           ens_test <- tryCatch({
             if (!any(is.na(meta_X)) && length(unique(meta_y)) >= 2 &&
@@ -499,12 +556,11 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
             } else 0.4*rf_test + 0.4*en_test + 0.2*gp_test
           }, error = function(e) 0.4*rf_test + 0.4*en_test + 0.2*gp_test)
           
-          en_pred_col <- if (is_a4) "LR_Pred" else "EN_Pred"
           fold_res <- data.frame(
             Date       = test_d$functional_date,
             Observed   = as.integer(y_test == "Yes"),
             RF_Pred    = as.numeric(rf_test),
-            EN_or_LR   = as.numeric(en_test),
+            EN_Pred    = as.numeric(en_test),
             GP_Pred    = as.numeric(gp_test),
             Ens_Pred   = as.numeric(ens_test),
             BaseProb   = base_prob,
@@ -512,14 +568,12 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
             TrainSize  = nrow(train_d),
             Imputation = imp_idx
           )
-          names(fold_res)[names(fold_res) == "EN_or_LR"] <- en_pred_col
+
           list(
-            fold_res   = fold_res,
-            fold_model = list(
-              rf = rf_mod, glmnet = en_mod, gp = gp_mod,
-              scaling = list(center = ctr, scale = scl),
-              predictors = fold_predictors,
-              is_logistic = is_a4)
+            fold_res = fold_res,
+            imp_rf   = imp_rf,
+            imp_en   = imp_en,
+            imp_gp   = imp_gp
           )
         }, error = function(e) {
           message("  Error fold ", fi, " imp ", imp_idx, ": ", e$message)
@@ -538,22 +592,28 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
       
       if (!is.null(fold_result)) {
         all_imp_preds[[imp_idx]] <- bind_rows(all_imp_preds[[imp_idx]], fold_result$fold_res)
-        stored_models[[imp_idx]][[sprintf("fold_%04d", fi)]] <- fold_result$fold_model
+
+        if (!is.null(fold_result$imp_rf))
+          imp_scores_by_model[["Random Forest"]][[imp_idx]] <-
+            c(imp_scores_by_model[["Random Forest"]][[imp_idx]], list(fold_result$imp_rf))
+        if (!is.null(fold_result$imp_en))
+          imp_scores_by_model[[en_label]][[imp_idx]] <-
+            c(imp_scores_by_model[[en_label]][[imp_idx]], list(fold_result$imp_en))
+        if (!is.null(fold_result$imp_gp))
+          imp_scores_by_model[["Gaussian Process"]][[imp_idx]] <-
+            c(imp_scores_by_model[["Gaussian Process"]][[imp_idx]], list(fold_result$imp_gp))
       }
     }
   }
-  
+
   valid_imps <- which(
     sapply(all_imp_preds, function(x) is.data.frame(x) && nrow(x) > 0))
   if (length(valid_imps) == 0) {
     message("  No valid imputation results for ", pid); return(NULL)
   }
-  
-  
-  model_cols        <- c("RF_Pred", if (is_a4) "LR_Pred" else "EN_Pred", "GP_Pred","Ens_Pred")
-  model_names_clean <- if (is_a4)
-    c("Random Forest","Logistic Regression","Gaussian Process","Ensemble") else
-      c("Random Forest","Elastic Net","Gaussian Process","Ensemble")
+
+  model_cols        <- c("RF_Pred", "EN_Pred", "GP_Pred","Ens_Pred")
+  model_names_clean <- c("Random Forest","Elastic Net","Gaussian Process","Ensemble")
   
   pooled_aucs <- setNames(vector("list", 4), model_names_clean)
   for (mc in seq_along(model_cols)) {
@@ -562,44 +622,13 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
     for (ii in seq_along(valid_imps)) {
       pd <- all_imp_preds[[valid_imps[ii]]]
       tryCatch({
-        r         <- roc(pd$Observed, pd[[model_cols[mc]]], quiet = TRUE)
+        r         <- roc(pd$Observed, pd[[model_cols[mc]]], 
+                         levels = c(0, 1), direction = "<", quiet = TRUE)
         aucs[ii]  <- as.numeric(auc(r))
         ses[ii]   <- sqrt(var(r))
       }, error = function(e) { aucs[ii] <<- 0.5; ses[ii] <<- 0.05 })
     }
     pooled_aucs[[model_names_clean[mc]]] <- pool_auc_rubins(aucs, ses)
-  }
-  
-  calc_metrics_one_imp <- function(obs, pred) {
-    tryCatch({
-      if (length(unique(obs)) < 2 || length(unique(pred)) < 2)
-        return(list(auc=0.5, sens=NA, spec=NA, ppv=NA, npv=NA,
-                    f1=NA, kappa=NA, kappa_se=NA, n=length(obs),
-                    npos=sum(obs==1), nneg=sum(obs==0)))
-      r  <- roc(obs, pred, quiet = TRUE)
-      co <- coords(r, "best", ret = c("threshold","sensitivity","specificity"),
-                   best.method = "youden")
-      co <- co[1, , drop = FALSE]
-      pc <- ifelse(pred >= co$threshold, 1, 0)
-      TP <- sum(pc==1&obs==1); TN <- sum(pc==0&obs==0)
-      FP <- sum(pc==1&obs==0); FN <- sum(pc==0&obs==1)
-      ppv <- ifelse(TP+FP>0, TP/(TP+FP), NA)
-      npv <- ifelse(TN+FN>0, TN/(TN+FN), NA)
-      f1  <- ifelse(!is.na(ppv) && co$sensitivity+ppv>0,
-                    2*ppv*co$sensitivity/(ppv+co$sensitivity), NA)
-      n   <- length(obs)
-      py  <- ((TP+FN)/n)*((TP+FP)/n); pn <- ((TN+FP)/n)*((TN+FN)/n)
-      kp  <- ifelse(py+pn<1, ((TP+TN)/n-(py+pn))/(1-(py+pn)), NA)
-      pe      <- py + pn
-      kp_se   <- ifelse(!is.na(kp) && pe < 1,
-                        sqrt(pe * (1 - pe) / (n * (1 - pe)^2)),
-                        NA_real_)
-      list(auc=as.numeric(auc(r)), sens=co$sensitivity, spec=co$specificity,
-           ppv=ppv, npv=npv, f1=f1, kappa=kp, kappa_se=kp_se,
-           n=n, npos=sum(obs==1), nneg=sum(obs==0))
-    }, error = function(e)
-      list(auc=0.5, sens=NA, spec=NA, ppv=NA, npv=NA,
-           f1=NA, kappa=NA, kappa_se=NA, n=length(obs), npos=NA, nneg=NA))
   }
   
   pool_one_model <- function(col, model_name) {
@@ -637,107 +666,30 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
   participant_sens_spec <- bind_rows(
     mapply(pool_one_model, model_cols, model_names_clean, SIMPLIFY = FALSE))
   
-  aggregated_importance <- data.frame()
-  en_label <- if (is_a4) "Logistic Regression" else "Elastic Net"
   
-  imp_scores_by_model <- setNames(
-    list(list(), list(), list()),
-    c("Random Forest", en_label, "Gaussian Process")
-  )
-  
-  # Hold out the final five complete EMA observations for permutation importance only.
-  ema_holdout <- if (!is.null(holdout_rds_file) && file.exists(holdout_rds_file))
-    readRDS(holdout_rds_file) else NULL
-  
-  if (is.null(ema_holdout) || length(ema_holdout) == 0) {
-    cat("  Skipping permutation importance - holdout set unavailable\n")
-  } else {
-    for (ii in valid_imps) {
-      fold_models_ii <- stored_models[[ii]]
-      last_fold_key  <- tail(names(fold_models_ii), 1)
-      last_fold_ii   <- fold_models_ii[[last_fold_key]]
-      if (is.null(last_fold_ii)) next
-      
-      # use the imputation-matched holdout split
-      holdout_ii <- if (ii <= length(ema_holdout)) ema_holdout[[ii]] else ema_holdout[[1]]
-      if (is.null(holdout_ii) || nrow(holdout_ii) < 2) next
-      if (length(unique(holdout_ii$pain_increasing)) < 2) next
-      
-      # align X_ii columns to exactly match the model's predictor set
-      imp_preds_ii <- if (!is.null(last_fold_ii$predictors))
-        last_fold_ii$predictors else valid_predictors
-      X_ii <- holdout_ii %>%
-        select(any_of(imp_preds_ii)) %>%
-        as.data.frame()
-      for (mc in setdiff(imp_preds_ii, names(X_ii))) X_ii[[mc]] <- NA_real_
-      X_ii <- X_ii[, imp_preds_ii, drop = FALSE]
-      X_ii <- X_ii %>% filter(rowSums(is.na(.)) == 0)
-      y_ii <- as.integer(holdout_ii$pain_increasing[
-        rowSums(is.na(holdout_ii %>% select(any_of(imp_preds_ii)))) == 0] == "Yes")
-      
-      if (nrow(X_ii) < 2 || length(unique(y_ii)) < 2) next
-      
-      if (!is.null(last_fold_ii$rf)) {
-        ri <- tryCatch(
-          calculate_permutation_importance(last_fold_ii$rf, X_ii, y_ii, type="rf"),
-          error = function(e) { cat("  [ERROR RF importance]:", e$message, "\n"); NULL }
-        )
-        if (!is.null(ri))
-          imp_scores_by_model[["Random Forest"]] <-
-            c(imp_scores_by_model[["Random Forest"]], list(ri))
-      }
-      if (!is.null(last_fold_ii$glmnet)) {
-        if (isTRUE(last_fold_ii$is_logistic)) {
-          ei <- tryCatch(
-            calculate_permutation_importance(last_fold_ii$glmnet, X_ii, y_ii, type="glm"),
-            error = function(e) { cat("  [ERROR EN importance]:", e$message, "\n"); NULL }
-          )
-        } else {
-          scale_vars <- names(last_fold_ii$scaling$center)
-          Xs_ii <- X_ii[, intersect(scale_vars, names(X_ii)), drop = FALSE]
-          for (mc in setdiff(scale_vars, names(X_ii))) Xs_ii[[mc]] <- NA_real_
-          Xs_ii <- as.data.frame(scale(Xs_ii[, scale_vars, drop=FALSE],
-                                       center = last_fold_ii$scaling$center,
-                                       scale  = last_fold_ii$scaling$scale))
-          ei <- tryCatch(
-            calculate_permutation_importance(last_fold_ii$glmnet, Xs_ii, y_ii, type="glmnet"),
-            error = function(e) { cat("  [ERROR EN importance]:", e$message, "\n"); NULL }
-          )
-        }
-        if (!is.null(ei))
-          imp_scores_by_model[[en_label]] <-
-            c(imp_scores_by_model[[en_label]], list(ei))
-      }
-      if (!is.null(last_fold_ii$gp)) {
-        scale_vars <- names(last_fold_ii$scaling$center)
-        Xs_ii <- X_ii[, intersect(scale_vars, names(X_ii)), drop = FALSE]
-        for (mc in setdiff(scale_vars, names(X_ii))) Xs_ii[[mc]] <- NA_real_
-        Xs_ii <- as.data.frame(scale(Xs_ii[, scale_vars, drop=FALSE],
-                                     center = last_fold_ii$scaling$center,
-                                     scale  = last_fold_ii$scaling$scale))
-        gi <- tryCatch(
-          calculate_permutation_importance(last_fold_ii$gp, Xs_ii, y_ii, type="gp"),
-          error = function(e) { cat("  [ERROR GP importance]:", e$message, "\n"); NULL }
-        )
-        if (!is.null(gi))
-          imp_scores_by_model[["Gaussian Process"]] <-
-          c(imp_scores_by_model[["Gaussian Process"]], list(gi))
-      }
-    }
-  }
-  
+  # Two-stage pooling: average across folds within each imputation first,
+  # then average those per-imputation results across imputations.
   imp_parts <- list()
   for (mn in names(imp_scores_by_model)) {
-    scores_list <- imp_scores_by_model[[mn]]
-    if (length(scores_list) == 0) next
-    all_vars   <- names(scores_list[[1]])
+    per_imp_means <- list()
+    for (ii in seq_len(m_imp)) {
+      fold_vecs <- imp_scores_by_model[[mn]][[ii]]
+      if (length(fold_vecs) == 0) next
+      fold_vars <- names(fold_vecs[[1]])
+      per_imp_means[[length(per_imp_means) + 1]] <- rowMeans(
+        do.call(cbind, lapply(fold_vecs, function(s) s[fold_vars])),
+        na.rm = TRUE)
+    }
+    if (length(per_imp_means) == 0) next
+    all_vars   <- names(per_imp_means[[1]])
     avg_scores <- rowMeans(
-      do.call(cbind, lapply(scores_list, function(s) s[all_vars])),
+      do.call(cbind, lapply(per_imp_means, function(s) s[all_vars])),
       na.rm = TRUE)
     imp_parts[[mn]] <- data.frame(
       Model = mn, Variable = all_vars, Mean_Importance = as.numeric(avg_scores))
   }
-  
+
+  aggregated_importance <- data.frame()
   if (length(imp_parts) > 0) {
     aggregated_importance <- bind_rows(imp_parts)
     ens_imp <- aggregated_importance %>%
@@ -758,7 +710,8 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
     row <- data.frame(Imputation = valid_imps[ii])
     for (mc in seq_along(model_cols)) tryCatch({
       row[[model_names_clean[mc]]] <-
-        as.numeric(auc(roc(pd$Observed, pd[[model_cols[mc]]], quiet=TRUE)))
+        as.numeric(auc(roc(pd$Observed, pd[[model_cols[mc]]], 
+                           levels = c(0, 1), direction = "<", quiet=TRUE)))
     }, error = function(e) { row[[model_names_clean[mc]]] <<- 0.5 })
     row
   })) %>%
@@ -778,10 +731,10 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
   if (nrow(aggregated_importance) > 0)
     write_csv(aggregated_importance,
               file.path(pdir, paste0(pid,"_feature_importance.csv")))
-  
+
   en_name   <- model_names_clean[2]
-  en_col    <- if (is_a4) "LogisticRegression_AUC" else "ElasticNet_AUC"
-  en_ci_col <- if (is_a4) "LR_CI" else "EN_CI"
+  en_col    <- "ElasticNet_AUC"
+  en_ci_col <- "EN_CI"
   best_base <- max(pooled_aucs[["Random Forest"]]$auc,
                    pooled_aucs[[en_name]]$auc,
                    pooled_aucs[["Gaussian Process"]]$auc)
@@ -806,10 +759,327 @@ build_participant_model <- function(pid, predictor_vars, patient_dir,
   result$Ensemble_Improvement = pooled_aucs[["Ensemble"]]$auc - best_base
   result$NumObservations     = nrow(all_imp_preds[[valid_imps[1]]])
   result$N_Imputations       = length(valid_imps)
-  
+
   saveRDS(result, file.path(pdir, paste0(pid, "_participant_summary_row.rds")))
-  
+
   result
+}
+
+
+###############################################################################
+# 4B - A4 LIGHTWEIGHT PIPELINE (NO IMPUTATION) + A4 NULL PERMUTATION TEST
+###############################################################################
+
+A4_PREDICTOR <- "overall_pain_lag1"
+A4_REAL_NAME <- "A4_Lag1PainOnly"
+A4_NULL_NAME <- "A4_NullModel"
+
+fold_cache_dir_a4 <- file.path(output_dir, "folds_a4")
+if (!dir.exists(fold_cache_dir_a4)) dir.create(fold_cache_dir_a4, recursive = TRUE)
+
+for (an in c(A4_REAL_NAME, A4_NULL_NAME)) {
+  d_results <- file.path(results_dir, an, "PatientResults")
+  if (!dir.exists(d_results)) dir.create(d_results, recursive = TRUE)
+  d_summary <- file.path(analysis_output_dir, an, "Summary")
+  if (!dir.exists(d_summary)) dir.create(d_summary, recursive = TRUE)
+}
+
+# Number of null permutations per participant.
+N_PERMUTATIONS <- 100
+
+# Hard ceiling (seconds) on a single null repeat — see run_null_repeat_with_hard_timeout().
+A4_NULL_REPEAT_TIMEOUT <- 10 * 60
+
+# Hard ceiling on total attempts (success + failure) per participant while
+# drawing fresh repeat numbers until N_PERMUTATIONS successes.
+A4_NULL_MAX_ATTEMPTS <- 150
+
+# Identical filter to the shared ema_complete_all computation in Section 5b.
+compute_ema_complete_all_a4 <- function(pid) {
+  base_data %>%
+    filter(StudyID == pid) %>%
+    arrange(time_block) %>%
+    filter(!is.na(pain_increasing),
+           !is.na(overall_pain_lag2),
+           !is.na(catastrophize_lag1), !is.na(catastrophize_lag2),
+           !is.na(depress_lag1),       !is.na(depress_lag2),
+           !is.na(interference_lag1),  !is.na(interference_lag2),
+           !is.na(ema_missing_lag1))
+}
+
+# One saved fold-index list per participant
+get_a4_fold_indices <- function(pid) {
+  idx_file <- file.path(fold_cache_dir_a4, paste0(pid, "_fold_indices.rds"))
+  if (file.exists(idx_file)) return(readRDS(idx_file))
+  ema_complete_all <- compute_ema_complete_all_a4(pid)
+  if (nrow(ema_complete_all) < ema_min) return(NULL)
+  folds <- create_rolling_folds(ema_complete_all, min_train = train_sz, val_size = val_sz,
+                                test_size = test_sz, expanding = TRUE)
+  if (length(folds) == 0) return(NULL)
+  saveRDS(folds, idx_file)
+  folds
+}
+
+# Single-sample AUC + DeLong-style CI (pool_auc_rubins() called with m = 1)
+single_auc_ci <- function(obs, pred) {
+  tryCatch({
+    r  <- roc(obs, pred, levels = c(0, 1), direction = "<", quiet = TRUE)
+    a  <- as.numeric(auc(r))
+    se <- sqrt(var(r))
+    pool_auc_rubins(a, se)
+  }, error = function(e) list(auc = 0.5, ci_lo = NA_real_, ci_hi = NA_real_, se = NA_real_))
+}
+
+# One fold's RF/LR/GP/Ensemble fit
+fit_a4_one_fold <- function(pid, train_d, val_d, test_d, fi, n_folds_total, seed, repeat_id = 0) {
+  base_prob <- mean(train_d$pain_increasing == "Yes", na.rm = TRUE)
+  if (min(table(train_d$pain_increasing)) < 2) return(NULL)
+
+  y_train <- train_d$pain_increasing
+  X_train <- as.data.frame(train_d %>% select(all_of(A4_PREDICTOR)))
+  y_val   <- val_d$pain_increasing
+  X_val   <- as.data.frame(val_d   %>% select(all_of(A4_PREDICTOR)))
+  y_test  <- test_d$pain_increasing
+  X_test  <- as.data.frame(test_d  %>% select(all_of(A4_PREDICTOR)))
+
+  if (length(unique(X_train[[1]])) <= 1) return(NULL)
+
+  set.seed(seed)
+  chunk_size <- max(5L, floor(nrow(X_train) / 4))
+  inner_cv   <- trainControl(
+    method          = "timeslice",
+    initialWindow   = chunk_size,
+    horizon         = chunk_size,
+    fixedWindow     = FALSE,
+    skip            = 1,
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary,
+    allowParallel   = FALSE
+  )
+
+  ctx_fold <- sprintf("[A4] [pid=%s] [fold=%02d/%02d] [repeat=%d]",
+                      pid, fi, n_folds_total, repeat_id)
+
+  withCallingHandlers(
+    tryCatch({
+    # Random Forest
+    rf_mod <- tryCatch(
+      R.utils::withTimeout(
+        train(x = X_train, y = y_train, method = "rf",
+              tuneGrid  = data.frame(mtry = 1L),
+              metric    = "ROC", ntree = 200,
+              trControl = inner_cv),
+        timeout = 300, onTimeout = "silent"),
+      error = function(e) NULL)
+    rf_val  <- if (!is.null(rf_mod)) predict(rf_mod, X_val,  type = "prob")$Yes else rep(base_prob, nrow(X_val))
+    rf_test <- if (!is.null(rf_mod)) predict(rf_mod, X_test, type = "prob")$Yes else rep(base_prob, nrow(X_test))
+
+    sc  <- scale(X_train)
+    ctr <- attr(sc, "scaled:center")
+    scl <- attr(sc, "scaled:scale"); scl[scl == 0] <- 1
+    Xvs <- as.data.frame(scale(X_val,  center = ctr, scale = scl))
+    Xts <- as.data.frame(scale(X_test, center = ctr, scale = scl))
+    sc  <- as.data.frame(sc)
+
+    # Logistic Regression
+    lr_mod <- tryCatch(
+      R.utils::withTimeout(
+        train(x = sc, y = y_train, method = "glm",
+              metric    = "ROC",
+              trControl = trainControl(method = "none", classProbs = TRUE,
+                                       summaryFunction = twoClassSummary),
+              family    = "binomial"),
+        timeout = 300, onTimeout = "silent"),
+      error = function(e) NULL)
+    lr_val  <- if (!is.null(lr_mod)) predict(lr_mod, Xvs, type = "prob")$Yes else rep(base_prob, nrow(X_val))
+    lr_test <- if (!is.null(lr_mod)) predict(lr_mod, Xts, type = "prob")$Yes else rep(base_prob, nrow(X_test))
+
+    # Gaussian Process
+    sigma_est <- kernlab::sigest(as.matrix(sc), scaled = FALSE)
+    gp_mod <- tryCatch(
+      R.utils::withTimeout(
+        train(x = sc, y = y_train, method = "gaussprRadial",
+              tuneGrid  = data.frame(sigma = c(sigma_est[1], sigma_est[2], sigma_est[3])),
+              metric    = "ROC",
+              trControl = inner_cv),
+        timeout = 300, onTimeout = "silent"),
+      error = function(e) NULL)
+    gp_val  <- if (!is.null(gp_mod)) predict(gp_mod, Xvs, type = "prob")$Yes else rep(base_prob, nrow(X_val))
+    gp_test <- if (!is.null(gp_mod)) predict(gp_mod, Xts, type = "prob")$Yes else rep(base_prob, nrow(X_test))
+
+    # Ensemble
+    meta_y <- as.numeric(y_val == "Yes")
+    meta_X <- data.frame(RF = rf_val, EN = lr_val, GP = gp_val)
+    ens_test <- tryCatch({
+      if (!any(is.na(meta_X)) && length(unique(meta_y)) >= 2 && min(table(meta_y)) >= 3) {
+        mm <- suppressWarnings(
+          glm(meta_y ~ RF + EN + GP, data = meta_X,
+              family  = binomial(),
+              control = glm.control(maxit = 100, epsilon = 1e-6))
+        )
+        fitted_p <- fitted(mm)
+        if (any(fitted_p <= 0.001 | fitted_p >= 0.999)) {
+          0.4*rf_test + 0.4*lr_test + 0.2*gp_test
+        } else {
+          predict(mm, data.frame(RF = rf_test, EN = lr_test, GP = gp_test), type = "response")
+        }
+      } else 0.4*rf_test + 0.4*lr_test + 0.2*gp_test
+    }, error = function(e) 0.4*rf_test + 0.4*lr_test + 0.2*gp_test)
+
+    fold_res <- data.frame(
+      Date      = test_d$functional_date,
+      Observed  = as.integer(y_test == "Yes"),
+      RF_Pred   = as.numeric(rf_test),
+      LR_Pred   = as.numeric(lr_test),
+      GP_Pred   = as.numeric(gp_test),
+      Ens_Pred  = as.numeric(ens_test),
+      BaseProb  = base_prob,
+      Fold      = fi,
+      TrainSize = nrow(train_d)
+    )
+
+    list(
+      fold_res = fold_res,
+      lr_fit   = if (fi == n_folds_total && !is.null(lr_mod)) lr_mod$finalModel else NULL
+    )
+    }, error = function(e) {
+      write_log(log_modeling, "ERROR", ctx_fold, e$message)
+      NULL
+    }),
+    warning = function(w) {
+      write_log(log_modeling, "WARN", ctx_fold, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    },
+    message = function(m) {
+      write_log(log_modeling, "MSG", ctx_fold, conditionMessage(m))
+      invokeRestart("muffleMessage")
+    }
+  )
+}
+
+# Runs the full A4 pipeline for one participant across every fold. shuffle =
+# TRUE draws one permutation of overall_pain_lag1 across the participant's
+# own ema_complete_all row order before slicing into folds.
+run_a4_participant <- function(pid, fold_indices, shuffle = FALSE, seed_offset = 0) {
+  ema_complete_all <- compute_ema_complete_all_a4(pid)
+  phash     <- sum(as.numeric(charToRaw(pid)))
+  base_seed <- 126 + phash + seed_offset * 1e6
+
+  if (shuffle) {
+    set.seed(base_seed + 9999)
+    ema_complete_all$overall_pain_lag1 <- sample(ema_complete_all$overall_pain_lag1)
+  }
+
+  n_folds_total <- length(fold_indices)
+  all_preds     <- data.frame()
+  lr_fit_last   <- NULL
+
+  for (fi in seq_along(fold_indices)) {
+    fold    <- fold_indices[[fi]]
+    train_d <- ema_complete_all[fold$train,      ]
+    val_d   <- ema_complete_all[fold$validation, ]
+    test_d  <- ema_complete_all[fold$test,       ]
+
+    fold_out <- fit_a4_one_fold(pid, train_d, val_d, test_d, fi, n_folds_total,
+                                seed = base_seed + fi, repeat_id = seed_offset)
+    if (!is.null(fold_out)) {
+      all_preds <- bind_rows(all_preds, fold_out$fold_res)
+      if (!is.null(fold_out$lr_fit)) lr_fit_last <- fold_out$lr_fit
+    }
+  }
+
+  if (nrow(all_preds) == 0) return(NULL)
+  list(preds = all_preds, lr_fit = lr_fit_last)
+}
+
+# Builds the participant_summary-row-equivalent result
+build_a4_result_row <- function(pid, run_out) {
+  preds       <- run_out$preds
+  model_cols  <- c("RF_Pred", "LR_Pred", "GP_Pred", "Ens_Pred")
+  model_names <- c("RandomForest_AUC", "LogisticRegression_AUC",
+                   "GaussianProcess_AUC", "Ensemble_AUC")
+  ci_cols     <- c("RF_CI", "LR_CI", "GP_CI", "Ens_CI")
+
+  aucs <- setNames(vector("list", 4), model_names)
+  for (i in seq_along(model_cols)) {
+    aucs[[model_names[i]]] <- single_auc_ci(preds$Observed, preds[[model_cols[i]]])
+  }
+
+  best_base <- max(aucs[["RandomForest_AUC"]]$auc, aucs[["LogisticRegression_AUC"]]$auc,
+                   aucs[["GaussianProcess_AUC"]]$auc)
+
+  result <- data.frame(StudyID = pid, stringsAsFactors = FALSE)
+  for (i in seq_along(model_names)) {
+    result[[model_names[i]]] <- aucs[[model_names[i]]]$auc
+    result[[ci_cols[i]]]     <- paste0("[", round(aucs[[model_names[i]]]$ci_lo, 3), ", ",
+                                       round(aucs[[model_names[i]]]$ci_hi, 3), "]")
+  }
+  result$BaselineAUC          <- 0.5
+  result$Best_Base_AUC        <- best_base
+  result$Ensemble_Improvement <- aucs[["Ensemble_AUC"]]$auc - best_base
+  result$Best_AUC             <- max(sapply(aucs, function(x) x$auc))
+  result$NumObservations      <- nrow(preds)
+
+  lr_summary <- NULL
+  if (!is.null(run_out$lr_fit)) {
+    lr_summary <- tryCatch({
+      s  <- summary(run_out$lr_fit)$coefficients
+      ci <- suppressMessages(confint(run_out$lr_fit))
+      data.frame(term = rownames(s), estimate = s[, 1], std.error = s[, 2],
+                statistic = s[, 3], p.value = s[, 4],
+                ci_lo = ci[, 1], ci_hi = ci[, 2], row.names = NULL)
+    }, error = function(e) NULL)
+  }
+  lag1_row <- if (!is.null(lr_summary) && "overall_pain_lag1" %in% lr_summary$term)
+    lr_summary[lr_summary$term == "overall_pain_lag1", ] else NULL
+
+  result$Lag1Pain_LR_Estimate  <- if (!is.null(lag1_row)) lag1_row$estimate  else NA_real_
+  result$Lag1Pain_LR_SE        <- if (!is.null(lag1_row)) lag1_row$std.error else NA_real_
+  result$Lag1Pain_LR_Statistic <- if (!is.null(lag1_row)) lag1_row$statistic else NA_real_
+  result$Lag1Pain_LR_CI_Lo     <- if (!is.null(lag1_row)) lag1_row$ci_lo     else NA_real_
+  result$Lag1Pain_LR_CI_Hi     <- if (!is.null(lag1_row)) lag1_row$ci_hi     else NA_real_
+  result$Lag1Pain_LR_P         <- if (!is.null(lag1_row)) lag1_row$p.value   else NA_real_
+
+  list(result = result, lr_summary = lr_summary, preds = preds)
+}
+
+# Get sens/Spec/PPV/NPV/kappa
+build_a4_sens_spec_table <- function(pid, preds) {
+  model_cols  <- c("RF_Pred", "LR_Pred", "GP_Pred", "Ens_Pred")
+  model_names <- c("Random Forest", "Logistic Regression", "Gaussian Process", "Ensemble")
+
+  safe_prop_ci <- function(val, n) {
+    if (is.na(val) || is.na(n) || n <= 0) return(list(ci_lo = NA_real_, ci_hi = NA_real_))
+    tryCatch(pool_proportion_rubins(val, n),
+             error = function(e) list(ci_lo = NA_real_, ci_hi = NA_real_))
+  }
+  safe_kappa_ci <- function(kappa, kappa_se) {
+    if (is.na(kappa) || is.na(kappa_se)) return(list(ci_lo = NA_real_, ci_hi = NA_real_))
+    tryCatch(pool_kappa_rubins(kappa, kappa_se),
+             error = function(e) list(ci_lo = NA_real_, ci_hi = NA_real_))
+  }
+
+  bind_rows(lapply(seq_along(model_cols), function(i) {
+    m      <- calc_metrics_one_imp(preds$Observed, preds[[model_cols[i]]])
+    auc_ci <- single_auc_ci(preds$Observed, preds[[model_cols[i]]])
+
+    sens_ci <- safe_prop_ci(m$sens, m$npos)
+    spec_ci <- safe_prop_ci(m$spec, m$nneg)
+    ppv_ci  <- safe_prop_ci(m$ppv,  m$npred_pos)
+    npv_ci  <- safe_prop_ci(m$npv,  m$npred_neg)
+    kap_ci  <- safe_kappa_ci(m$kappa, m$kappa_se)
+
+    data.frame(
+      StudyID = pid, Model = model_names[i],
+      AUC = auc_ci$auc, AUC_CI_lo = auc_ci$ci_lo, AUC_CI_hi = auc_ci$ci_hi,
+      Sensitivity = m$sens, Sens_CI_lo = sens_ci$ci_lo, Sens_CI_hi = sens_ci$ci_hi,
+      Specificity = m$spec, Spec_CI_lo = spec_ci$ci_lo, Spec_CI_hi = spec_ci$ci_hi,
+      PPV = m$ppv, PPV_CI_lo = ppv_ci$ci_lo, PPV_CI_hi = ppv_ci$ci_hi,
+      NPV = m$npv, NPV_CI_lo = npv_ci$ci_lo, NPV_CI_hi = npv_ci$ci_hi,
+      Kappa = m$kappa, Kappa_CI_lo = kap_ci$ci_lo, Kappa_CI_hi = kap_ci$ci_hi,
+      N_Obs = m$n, N_Pos = m$npos, N_Neg = m$nneg
+    )
+  }))
 }
 
 
@@ -829,12 +1099,6 @@ base_data <- df_ema %>%
     pain_flag       = case_when(
       is.na(overall_pain_lag1) | is.na(diff) ~ NA_integer_,
       (diff > 0) ~ 1L, TRUE ~ 0L),
-    # pain_flag         = case_when(
-    #   is.na(overall_pain_lag1) | is.na(diff) ~ NA_integer_,
-    #   (overall_pain_lag1 >= 30 & diff >= 0)  |
-    #     (overall_pain_lag1 <  30 & diff >= 10) |
-    #     (overall_pain_lag1 == 0  & diff >= 10) ~ 1L,
-    #   TRUE ~ 0L),
     total_transition  = max(cumsum(replace(pain_flag, is.na(pain_flag), 0))),
     n                 = n(),
     perc_transition   = total_transition / n,
@@ -858,6 +1122,7 @@ base_data <- df_ema %>%
   filter(!is.na(overall_pain)) %>%
   filter(perc_transition >= .2 & perc_transition <= .8)
 
+# prior to additional participant eligibility filtering
 cat("Class distribution (observed sequence):",
     table(base_data$pain_increasing), "\n")
 
@@ -912,8 +1177,7 @@ if (file.exists(window_missingness_csv)) {
     mutate(window_start = time_block - hours(1),
            window_end   = time_block)
   
-  # vectorised non-equi join: assign each sensor row to its EMA window in one pass
-  # this replaces a row-by-row filter loop (O(n_ema * n_sensor) -> O(n_sensor log n))
+  # vectorized non-equi join: assign each sensor row to its EMA window in one pass
   sensor_dt  <- as.data.table(df_expanded)[,
                                            .(StudyID, time_block, hr_missing, sleep_missing)]
   windows_dt <- as.data.table(ema_timestamps)
@@ -977,6 +1241,7 @@ eligible <- base_data %>%
   ) %>%
   arrange(desc(count)) %>%
   pull(StudyID)
+
 
 cat("Eligible participants:", length(eligible),
     sprintf("(>= %d HR valid windows, >= %g sleep valid days)\n",
@@ -1195,127 +1460,6 @@ impute_fold <- function(train_5min, newdata_5min, m = m_imp, seed = 126) {
     }
     result[[i]] <- list(train=tr_i, newdata=nd_i, mu_op=mu_op)
   }
-  # return mice objects alongside completed data so impute_holdout can reuse them
-  attr(result, "imp_5min_tr") <- imp_5min_tr
-  attr(result, "imp_sl_tr")   <- imp_sl_tr
-  attr(result, "imp_op_tr")   <- imp_op_tr
-  attr(result, "mu_hr")       <- mu_hr
-  attr(result, "mu_steps")    <- mu_steps
-  attr(result, "mu_sl")       <- mu_sl
-  attr(result, "mu_op")       <- mu_op
-  attr(result, "d_train")     <- d_train
-  result
-}
-
-impute_holdout <- function(last_fold_imp, nd5_holdout, m = m_imp) {
-  # reuse trained mice objects from the last fold instead of re-running MICE
-  imp_5min_tr <- attr(last_fold_imp, "imp_5min_tr")
-  imp_sl_tr   <- attr(last_fold_imp, "imp_sl_tr")
-  imp_op_tr   <- attr(last_fold_imp, "imp_op_tr")
-  mu_hr       <- attr(last_fold_imp, "mu_hr")
-  mu_steps    <- attr(last_fold_imp, "mu_steps")
-  mu_sl       <- attr(last_fold_imp, "mu_sl")
-  mu_op       <- attr(last_fold_imp, "mu_op")
-  d_train     <- attr(last_fold_imp, "d_train")
-  
-  vars_5min <- c("hr","steps")
-  mean_fb <- function(train_vec, new_vec) {
-    mu <- mean(train_vec, na.rm = TRUE)
-    if (is.nan(mu) || is.na(mu)) mu <- 0
-    ifelse(is.na(new_vec), mu, new_vec)
-  }
-  
-  d_new <- nd5_holdout %>%
-    select(any_of(names(d_train))) %>%
-    mutate(across(where(is.logical), as.numeric))
-  
-  daily_nd <- nd5_holdout %>%
-    group_by(day) %>%
-    summarise(
-      totalMinutesAsleep = first_or_na(totalMinutesAsleep),
-      opioid_num = if ("opioid_num" %in% names(nd5_holdout)) first_or_na(opioid_num) else NA_real_,
-      .groups = "drop"
-    )
-  # use training means for hr_mean/steps_sum fill in daily_nd
-  daily_tr_summary <- d_train %>%
-    group_by(day) %>%
-    summarise(hr_mean = mean(hr, na.rm=TRUE), steps_sum = sum(steps, na.rm=TRUE),
-              is_weekend = first(is_weekend), .groups="drop")
-  daily_nd_full <- nd5_holdout %>%
-    select(day, functional_date) %>% distinct() %>%
-    right_join(daily_nd, by = "day") %>%
-    left_join(daily_tr_summary %>% select(day, is_weekend, hr_mean, steps_sum), by = "day") %>%
-    mutate(
-      is_weekend = ifelse(is.na(is_weekend),
-                          as.numeric(weekdays(functional_date) %in% c("Saturday","Sunday")),
-                          is_weekend),
-      hr_mean   = ifelse(is.na(hr_mean),   mean(daily_tr_summary$hr_mean,   na.rm=TRUE), hr_mean),
-      steps_sum = ifelse(is.na(steps_sum), mean(daily_tr_summary$steps_sum, na.rm=TRUE), steps_sum)
-    )
-  
-  result <- vector("list", m)
-  for (i in seq_len(m)) {
-    nd_i <- nd5_holdout
-    
-    if (!is.null(imp_5min_tr)) {
-      tryCatch({
-        reused <- mice.reuse(imp_5min_tr, d_new, maxit=3, printFlag=FALSE)
-        comp_nd <- as.data.frame(reused[[i]])
-        for (v in vars_5min) if (v %in% names(comp_nd)) nd_i[[v]] <- comp_nd[[v]]
-        nd_i$hr    <- ifelse(is.na(nd_i$hr),    mu_hr,    nd_i$hr)
-        nd_i$steps <- ifelse(is.na(nd_i$steps), mu_steps, nd_i$steps)
-      }, error = function(e) {
-        message("  [holdout mice.reuse hr/steps failed, using mean] ", e$message)
-        nd_i$hr    <<- ifelse(is.na(nd_i$hr),    mu_hr,    nd_i$hr)
-        nd_i$steps <<- ifelse(is.na(nd_i$steps), mu_steps, nd_i$steps)
-      })
-    } else {
-      nd_i$hr    <- ifelse(is.na(nd_i$hr),    mu_hr,    nd_i$hr)
-      nd_i$steps <- ifelse(is.na(nd_i$steps), mu_steps, nd_i$steps)
-    }
-    
-    if (!is.null(imp_sl_tr)) {
-      tryCatch({
-        reused_sl <- mice.reuse(imp_sl_tr,
-                                daily_nd_full %>% select(day,is_weekend,hr_mean,steps_sum,totalMinutesAsleep),
-                                maxit=3, printFlag=FALSE)
-        sl_nd <- as.data.frame(reused_sl[[i]]) %>%
-          select(day,totalMinutesAsleep) %>% rename(sl_imp=totalMinutesAsleep)
-        nd_i <- nd_i %>% left_join(sl_nd, by="day") %>%
-          mutate(totalMinutesAsleep=ifelse(is.na(sl_imp),totalMinutesAsleep,sl_imp)) %>%
-          select(-sl_imp)
-        nd_i$totalMinutesAsleep <- ifelse(is.na(nd_i$totalMinutesAsleep), mu_sl, nd_i$totalMinutesAsleep)
-      }, error = function(e) {
-        message("  [holdout mice.reuse sleep failed, using mean] ", e$message)
-        nd_i$totalMinutesAsleep <<- ifelse(is.na(nd_i$totalMinutesAsleep), mu_sl, nd_i$totalMinutesAsleep)
-      })
-    }
-    
-    if (!is.null(imp_op_tr)) {
-      tryCatch({
-        reused_op <- mice.reuse(imp_op_tr,
-                                daily_nd_full %>% select(day,is_weekend,hr_mean,steps_sum,opioid_num),
-                                maxit=3, printFlag=FALSE)
-        op_nd <- as.data.frame(reused_op[[i]]) %>%
-          select(day,opioid_num) %>% rename(op_imp=opioid_num)
-        nd_i <- nd_i %>% left_join(op_nd, by="day") %>%
-          mutate(opioid_num=ifelse(is.na(op_imp),opioid_num,op_imp)) %>%
-          select(-op_imp)
-        if ("opioid_num" %in% names(nd_i))
-          nd_i$opioid_num <- ifelse(is.na(nd_i$opioid_num), mu_op, nd_i$opioid_num)
-      }, error = function(e) {
-        message("  [holdout mice.reuse opioid failed, using mean] ", e$message)
-        if ("opioid_num" %in% names(nd_i))
-          nd_i$opioid_num <<- ifelse(is.na(nd_i$opioid_num), mu_op, nd_i$opioid_num)
-      })
-    }
-    
-    result[[i]] <- list(
-      train   = last_fold_imp[[i]]$train,   # pass through unchanged
-      newdata = nd_i,
-      mu_op   = mu_op
-    )
-  }
   result
 }
 
@@ -1388,22 +1532,24 @@ for (i in seq_along(eligible)) {
            !is.na(depress_lag1),       !is.na(depress_lag2),
            !is.na(interference_lag1),  !is.na(interference_lag2),
            !is.na(ema_missing_lag1))
-  n_complete       <- nrow(ema_complete_all)
-  ema_obs_complete <- ema_complete_all %>% slice(1:(n_complete - 5))
-  ema_holdout      <- ema_complete_all %>% slice((n_complete - 4):n_complete)
-  
-  tmp_folds <- create_rolling_folds(ema_obs_complete, min_train=20, val_size=10,
-                                    test_size=1, expanding=TRUE)
+
+  if (nrow(ema_complete_all) < ema_min) {
+    cat(sprintf("[%d/%d] %s — too few complete EMA rows (%d), skipping\n",
+                i, length(eligible), pid, nrow(ema_complete_all)))
+    next
+  }
+
+  tmp_folds <- create_rolling_folds(ema_complete_all, min_train=train_sz, val_size=val_sz,
+                                    test_size=test_sz, expanding=TRUE)
   if (length(tmp_folds) == 0) {
     cat(sprintf("[%d/%d] %s — no valid folds, skipping\n",i,length(eligible),pid))
     next
   }
-  
+
   n_folds           <- length(tmp_folds)
   fold_rds_files_5b <- file.path(pid_fold_dir, sprintf("fold_%04d.rds", seq_len(n_folds)))
-  holdout_rds_file  <- file.path(pid_fold_dir, "holdout.rds")
-  
-  if (all(file.exists(fold_rds_files_5b)) && file.exists(holdout_rds_file)) {
+
+  if (all(file.exists(fold_rds_files_5b))) {
     cat(sprintf("[%d/%d] %s — fold RDS cached (%d folds)\n",
                 i,length(eligible),pid,n_folds))
     next
@@ -1432,9 +1578,9 @@ for (i in seq_along(eligible)) {
       if (file.exists(fold_rds_files_5b[[fi]])) next
       fold <- tmp_folds[[fi]]
       
-      ema_tr <- ema_obs_complete[fold$train,      ]
-      ema_vl <- ema_obs_complete[fold$validation, ]
-      ema_ts <- ema_obs_complete[fold$test,       ]
+      ema_tr <- ema_complete_all[fold$train,      ]
+      ema_vl <- ema_complete_all[fold$validation, ]
+      ema_ts <- ema_complete_all[fold$test,       ]
       
       train_end <- max(ema_tr$time_block)
       test_end  <- max(ema_ts$time_block)
@@ -1474,56 +1620,8 @@ for (i in seq_along(eligible)) {
       
       saveRDS(fold_features, fold_rds_files_5b[[fi]])
       cat(sprintf("  Saved fold %02d/%02d\n", fi, n_folds))
-      
-      # keep reference to last fold's imputation and training cutoff
-      last_fold_imp       <- fold_imp
-      last_fold_train_end <- train_end
     }
-    
-    holdout_end <- max(ema_holdout$time_block)
-    nd5_holdout <- pid_5min %>%
-      filter(time_block > last_fold_train_end & time_block <= holdout_end)
-    
-    if (nrow(nd5_holdout) >= 1) {
-      ctx_ho <- sprintf("[pid=%s] [holdout] [impute_holdout]", pid)
-      
-      holdout_imp <- withCallingHandlers(
-        impute_holdout(last_fold_imp, nd5_holdout, m=m_imp),
-        warning = function(w) {
-          if (!grepl("longer object length", conditionMessage(w)))
-            write_log(log_imputation, "WARN", ctx_ho, conditionMessage(w))
-          invokeRestart("muffleWarning")
-        },
-        message = function(m) {
-          write_log(log_imputation, "MSG", ctx_ho, conditionMessage(m))
-          invokeRestart("muffleMessage")
-        }
-      )
-      
-      ema_dummy_tr <- ema_obs_complete[nrow(ema_obs_complete), ]
-      ema_dummy_vl <- ema_obs_complete[nrow(ema_obs_complete), ]
-      holdout_features <- withCallingHandlers(
-        build_fold_features(pid, ema_dummy_tr, ema_dummy_vl,
-                            ema_holdout, holdout_imp, m=m_imp),
-        warning = function(w) {
-          if (!grepl("longer object length", conditionMessage(w)))
-            write_log(log_imputation, "WARN", ctx_ho, conditionMessage(w))
-          invokeRestart("muffleWarning")
-        },
-        message = function(m) {
-          write_log(log_imputation, "MSG", ctx_ho, conditionMessage(m))
-          invokeRestart("muffleMessage")
-        }
-      )
-      
-      holdout_rds <- lapply(holdout_features, function(x) x$test)
-      saveRDS(holdout_rds, holdout_rds_file)
-      cat("  Saved holdout with Fitbit + EMA features\n")
-    } else {
-      saveRDS(ema_holdout, holdout_rds_file)
-      cat("  Saved holdout (raw EMA only — no sensor data for holdout window)\n")
-    }
-    
+
     gc()
     cat(sprintf("  Done: %s\n", pid))
   }, error = function(e) {
@@ -1573,26 +1671,25 @@ for (analysis in analyses) {
   
   for (i in seq_along(remaining)) {
     pid <- remaining[i]
+    
     cat("\n[", an, "] Processing", i, "/", length(remaining), ":", pid, "\n")
     set.seed(126 + which(eligible == pid))
     
     pid_fold_dir     <- file.path(fold_cache_dir, pid)
     fold_rds_files   <- sort(list.files(pid_fold_dir, pattern="^fold_.*\\.rds$",
                                         full.names = TRUE))
-    holdout_rds_file <- file.path(pid_fold_dir, "holdout.rds")
     if (length(fold_rds_files) == 0) {
       cat("  No fold RDS files for", pid, "(skipped)\n")
       next
     }
     cat(sprintf("  Loading %d fold RDS files\n", length(fold_rds_files)))
-    
+
     ctx_pid <- sprintf("[%s] [pid=%s]", an, pid)
     res <- withCallingHandlers(
       tryCatch(
         build_participant_model(pid, pvars, patient_dir,
                                 analysis_name    = an,
-                                fold_rds_files   = fold_rds_files,
-                                holdout_rds_file = holdout_rds_file),
+                                fold_rds_files   = fold_rds_files),
         error = function(e) {
           message("  Unhandled error for ", pid, ": ", e$message)
           write_log(log_modeling, "ERROR", ctx_pid, e$message)
@@ -1626,6 +1723,244 @@ for (analysis in analyses) {
   cat("\n[", an, "] Complete.",
       nrow(existing_summary), "participants in summary.\n")
 }
+
+
+###############################################################################
+# 7 - A4 PIPELINE: REAL RUN + NULL PERMUTATION TEST
+###############################################################################
+
+cat("\n\n========================================\n")
+cat("Analysis:", A4_REAL_NAME, "(lightweight, no imputation)\n")
+cat("========================================\n")
+
+patient_dir_a4real <- file.path(results_dir, A4_REAL_NAME, "PatientResults")
+summary_dir_a4real <- file.path(analysis_output_dir, A4_REAL_NAME, "Summary")
+summary_csv_a4real <- file.path(summary_dir_a4real, paste0(A4_REAL_NAME, "_participant_summary.csv"))
+
+has_results_a4 <- sapply(eligible, function(pid)
+  file.exists(file.path(patient_dir_a4real, pid, paste0(pid, "_participant_summary_row.rds"))))
+done_pids_a4 <- eligible[has_results_a4]
+remaining_a4 <- eligible[!has_results_a4]
+
+cat("Participants with existing results:", length(done_pids_a4), "\n")
+cat("Remaining to process:", length(remaining_a4), "\n")
+
+existing_summary_a4 <- bind_rows(lapply(done_pids_a4, function(pid)
+  readRDS(file.path(patient_dir_a4real, pid, paste0(pid, "_participant_summary_row.rds")))))
+
+for (i in seq_along(remaining_a4)) {
+  pid <- remaining_a4[i]
+  cat("\n[", A4_REAL_NAME, "] Processing", i, "/", length(remaining_a4), ":", pid, "\n")
+
+  fold_indices <- get_a4_fold_indices(pid)
+  if (is.null(fold_indices)) {
+    cat("  No usable folds for", pid, "(skipped)\n")
+    next
+  }
+
+  run_out <- tryCatch(
+    run_a4_participant(pid, fold_indices, shuffle = FALSE),
+    error = function(e) { message("  Error for ", pid, ": ", e$message); NULL }
+  )
+  if (is.null(run_out)) {
+    cat("  No result for", pid, "(skipped)\n")
+    next
+  }
+
+  built <- build_a4_result_row(pid, run_out)
+  pdir  <- file.path(patient_dir_a4real, pid)
+  if (!dir.exists(pdir)) dir.create(pdir, recursive = TRUE)
+
+  write_csv(built$preds, file.path(pdir, paste0(pid, "_predictions.csv")))
+  if (!is.null(built$lr_summary))
+    write_csv(built$lr_summary, file.path(pdir, paste0(pid, "_lag1_lr_summary.csv")))
+  if (!is.null(run_out$lr_fit))
+    saveRDS(run_out$lr_fit, file.path(pdir, paste0(pid, "_lag1_lr_model.rds")))
+  write_csv(build_a4_sens_spec_table(pid, built$preds),
+            file.path(pdir, paste0(pid, "_pooled_sens_spec.csv")))
+
+  saveRDS(built$result, file.path(pdir, paste0(pid, "_participant_summary_row.rds")))
+  existing_summary_a4 <- bind_rows(existing_summary_a4, built$result)
+  write_csv(existing_summary_a4, summary_csv_a4real)
+  cat("  Saved summary row for", pid, "| Best AUC:", round(built$result$Best_AUC, 3), "\n")
+}
+
+if (nrow(existing_summary_a4) > 0) write_csv(existing_summary_a4, summary_csv_a4real)
+cat("\n[", A4_REAL_NAME, "] Complete.", nrow(existing_summary_a4), "participants in summary.\n")
+
+
+cat("\n\n========================================\n")
+cat("Analysis:", A4_NULL_NAME, "(", N_PERMUTATIONS, "permutations, all 4 models per repeat)\n")
+cat("========================================\n")
+
+patient_dir_a4null <- file.path(results_dir, A4_NULL_NAME, "PatientResults")
+
+# Per-repeat progress is written to a file
+a4_null_progress_log <- file.path(results_dir, A4_NULL_NAME, "null_progress.log")
+
+run_one_null_repeat <- function(pid, fold_indices, repeat_id, i, total) {
+  tryCatch(
+    cat("[", i, "/", total, "]", pid, "- repeat", repeat_id, "\n",
+        file = a4_null_progress_log, append = TRUE),
+    error = function(e) invisible(NULL)
+  )
+  run_out <- run_a4_participant(pid, fold_indices, shuffle = TRUE, seed_offset = repeat_id)
+  if (is.null(run_out)) return(NULL)
+  built <- build_a4_result_row(pid, run_out)
+  r <- built$result
+  r$Repeat <- repeat_id
+  preds <- built$preds
+  preds$Repeat <- repeat_id
+  list(result = r, preds = preds, lr_fit = run_out$lr_fit)
+}
+
+run_null_repeat_with_hard_timeout <- function(pid, fold_indices, repeat_id, i, total, timeout) {
+  job   <- parallel::mcparallel(run_one_null_repeat(pid, fold_indices, repeat_id, i, total))
+  start <- Sys.time()
+  result <- NULL
+  repeat {
+    result <- parallel::mccollect(job, wait = FALSE)
+    if (!is.null(result)) break
+    if (as.numeric(Sys.time() - start, units = "secs") > timeout) break
+    Sys.sleep(0.5)
+  }
+
+  if (is.null(result)) {
+    tools::pskill(job$pid, signal = tools::SIGKILL)
+    invisible(parallel::mccollect(job, wait = FALSE))  # reap the killed process
+    tryCatch(
+      cat("[", i, "/", total, "]", pid, "- repeat", repeat_id,
+          "exceeded", timeout, "s and was killed — moving to next repeat\n",
+          file = a4_null_progress_log, append = TRUE),
+      error = function(e) invisible(NULL)
+    )
+    return(NULL)
+  }
+
+  if (inherits(result[[1]], "try-error")) {
+    stop("Error in null repeat ", repeat_id, " for participant ", pid,
+        ": ", conditionMessage(attr(result[[1]], "condition")))
+  }
+
+  result[[1]]
+}
+
+# Only run the null model for participants who actually have a real
+# A4_Lag1PainOnly result
+a4_null_pids <- intersect(eligible, existing_summary_a4$StudyID)
+cat("Running null model for", length(a4_null_pids), "/", length(eligible),
+    "eligible participants (those with a real", A4_REAL_NAME, "result)\n")
+
+# Parallelized across participants (not across repeats within a participant)
+A4_NULL_PARTICIPANT_CORES <- max(1L, parallel::detectCores() - 1L)
+
+run_null_model_for_one_participant <- function(i, pid, total) {
+  fold_indices <- get_a4_fold_indices(pid)
+  if (is.null(fold_indices)) return(invisible(NULL))
+
+  pdir <- file.path(patient_dir_a4null, pid)
+  if (!dir.exists(pdir)) dir.create(pdir, recursive = TRUE)
+  dist_file      <- file.path(pdir, paste0(pid, "_null_distribution.csv"))
+  preds_file     <- file.path(pdir, paste0(pid, "_null_predictions.csv"))
+  lrmod_file     <- file.path(pdir, paste0(pid, "_null_lr_models.rds"))
+  attempted_file <- file.path(pdir, paste0(pid, "_null_attempted_repeats.csv"))
+
+  # attempted_file tracks every repeat number ever tried (success or not)
+  existing_dist  <- data.frame()
+  existing_preds <- data.frame()
+  existing_lr    <- list()
+  attempted      <- integer(0)
+  if (file.exists(dist_file))      existing_dist  <- read_csv(dist_file, show_col_types = FALSE)
+  if (file.exists(preds_file))     existing_preds <- read_csv(preds_file, show_col_types = FALSE)
+  if (file.exists(lrmod_file))     existing_lr    <- readRDS(lrmod_file)
+  if (file.exists(attempted_file)) attempted      <- read_csv(attempted_file, show_col_types = FALSE)$Repeat
+
+  dup_before <- nrow(existing_dist)
+  if (nrow(existing_dist) > 0)
+    existing_dist <- existing_dist[!duplicated(existing_dist$Repeat), ]
+  if (nrow(existing_preds) > 0 && all(c("Repeat", "Fold") %in% names(existing_preds)))
+    existing_preds <- existing_preds[!duplicated(existing_preds[, c("Repeat", "Fold")]), ]
+  if (dup_before > nrow(existing_dist)) {
+    cat("  Removed", dup_before - nrow(existing_dist),
+        "duplicate distribution row(s) for", pid, "found on disk — rewriting corrected files\n")
+    write_csv(existing_dist, dist_file)
+    write_csv(existing_preds, preds_file)
+  }
+
+  attempted <- unique(c(attempted, existing_dist$Repeat))
+
+  n_success  <- if (nrow(existing_dist) > 0) length(unique(existing_dist$Repeat)) else 0
+  n_attempts <- length(attempted)
+
+  if (n_success >= N_PERMUTATIONS) {
+    cat("[", i, "/", total, "]", pid, "— null distribution already complete\n")
+    return(invisible(NULL))
+  }
+  if (n_attempts >= A4_NULL_MAX_ATTEMPTS) {
+    cat("[", i, "/", total, "]", pid, "—", n_success, "/", N_PERMUTATIONS,
+        "successes after", n_attempts, "attempts; already at the", A4_NULL_MAX_ATTEMPTS,
+        "-attempt ceiling, giving up on this participant\n")
+    return(invisible(NULL))
+  }
+
+  cat("[", i, "/", total, "]", pid, "—", n_success, "/", N_PERMUTATIONS,
+      "successes so far,", n_attempts, "attempts made; continuing\n")
+
+  # Keeps drawing fresh repeat numbers until N_PERMUTATIONS successes are reached
+  # or A4_NULL_MAX_ATTEMPTS total attempts are used up.
+  while (n_success < N_PERMUTATIONS && n_attempts < A4_NULL_MAX_ATTEMPTS) {
+    r <- if (length(attempted) > 0) max(attempted) + 1L else 1L
+
+    res <- run_null_repeat_with_hard_timeout(pid, fold_indices, r, i, total,
+                                             A4_NULL_REPEAT_TIMEOUT)
+
+    attempted  <- c(attempted, r)
+    n_attempts <- n_attempts + 1
+    write_csv(data.frame(Repeat = attempted), attempted_file)
+
+    if (is.null(res)) {
+      cat("  Attempt", r, "returned no result / timed out (not an error) —",
+          n_success, "/", N_PERMUTATIONS, "successes,", n_attempts, "total attempts for", pid, "\n")
+      next
+    }
+
+    existing_dist <- bind_rows(existing_dist, res$result)
+    existing_dist <- existing_dist[order(existing_dist$Repeat), ]
+    write_csv(existing_dist, dist_file)
+
+    existing_preds <- bind_rows(existing_preds, res$preds)
+    write_csv(existing_preds, preds_file)
+
+    existing_lr[as.character(r)] <- list(res$lr_fit)
+    saveRDS(existing_lr, lrmod_file)
+
+    n_success <- n_success + 1
+    cat("  Saved attempt", r, "as success", n_success, "/", N_PERMUTATIONS,
+        "(result + raw predictions + LR model) for", pid, "\n")
+  }
+
+  if (n_success < N_PERMUTATIONS) {
+    cat("[", i, "/", total, "]", pid, "stopped at", n_success, "/", N_PERMUTATIONS,
+        "successes after", n_attempts, "attempts (", A4_NULL_MAX_ATTEMPTS, "-attempt ceiling reached)\n")
+  }
+  invisible(NULL)
+}
+
+null_model_results <- parallel::mclapply(
+  seq_along(a4_null_pids),
+  function(i) run_null_model_for_one_participant(i, a4_null_pids[i], length(a4_null_pids)),
+  mc.cores = A4_NULL_PARTICIPANT_CORES
+)
+
+null_err_idx <- which(sapply(null_model_results, inherits, what = "try-error"))
+if (length(null_err_idx) > 0) {
+  first_err <- null_model_results[[null_err_idx[1]]]
+  stop("Error while processing participant '", a4_null_pids[null_err_idx[1]],
+      "' in the null model loop: ", conditionMessage(attr(first_err, "condition")))
+}
+
+cat("\n[", A4_NULL_NAME, "] Complete.\n")
+
 
 cat("\n=== Stage 2 complete. Run step3_analysis.R ===\n")
 cat(sprintf("Imputation log: %s\n", log_imputation))

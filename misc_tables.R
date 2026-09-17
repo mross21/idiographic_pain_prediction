@@ -71,7 +71,7 @@ print(demographics_table, showAllLevels = TRUE, formatOptions = list(big.mark = 
 
 
 ################################################################################
-# 2 - PREDICTOR MISSINGNESS
+# 2 - PAIN OUTCOME DISTRIBUTION & PREDICTOR MISSINGNESS
 ################################################################################
 
 # Use the pre-modeling EMA file to summarize missingness before imputation.
@@ -144,14 +144,37 @@ base_data <- df_ema %>%
   ungroup() %>%
   filter(perc_transition >= 0.2 & perc_transition <= 0.8)
 
-ema_windows <- base_data %>%
+ema_windows_full <- base_data %>%
   filter(
     StudyID %in% eligible_ids,
     !is.na(pain_increasing),
     !is.na(catastrophize),
     !is.na(depress),
     !is.na(interference)
-  ) %>%
+  )
+
+# Get classification distribution table
+avg_diff_by_class <- ema_windows_full %>%
+  group_by(pain_increasing) %>%
+  summarise(Avg_Diff = round(mean(diff, na.rm = TRUE), 2), .groups = "drop")
+
+pain_increasing_table <- tibble(
+  Class = c("No", "Yes"),
+  N = as.integer(table(ema_windows_full$pain_increasing)),
+  Pct = round(as.numeric(prop.table(table(ema_windows_full$pain_increasing))) * 100, 1)
+) %>%
+  left_join(avg_diff_by_class, by = c("Class" = "pain_increasing")) %>%
+  bind_rows(tibble(
+    Class = "Total",
+    N = sum(.$N),
+    Pct = sum(.$Pct),
+    Avg_Diff = round(mean(ema_windows_full$diff, na.rm = TRUE), 2)
+  ))
+
+cat("\nPain-increasing class distribution (eligible sample):\n")
+print(pain_increasing_table)
+
+ema_windows <- ema_windows_full %>%
   select(StudyID, time_block, functional_date) %>%
   mutate(
     window_start = time_block - hours(1),
@@ -222,3 +245,52 @@ predictor_missingness_table <- bind_rows(
 )
 
 print(predictor_missingness_table)
+
+
+################################################################################
+# 3 - REPLICATE STEP 2'S BASE_DATA + DATA WINDOWS PER PARTICIPANT
+################################################################################
+
+# Derive a new df from the existing base_data, adding the remaining lag
+# columns 
+base_data_full <- base_data %>%
+  group_by(StudyID) %>%
+  arrange(time_block) %>%
+  mutate(
+    days_since_first_ema = as.numeric(difftime(functional_date, min(functional_date), units = "days")),
+    # Compute EMA lags before filtering so gaps do not reset the sequence.
+    overall_pain_lag2   = lag(overall_pain,  2),
+    catastrophize_lag1  = lag(catastrophize, 1),
+    catastrophize_lag2  = lag(catastrophize, 2),
+    depress_lag1        = lag(depress,       1),
+    depress_lag2        = lag(depress,       2),
+    interference_lag1   = lag(interference,  1),
+    interference_lag2   = lag(interference,  2),
+    ema_missing_lag1     = lag(ema_missing,   1)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(overall_pain))
+
+# Rows of data ("data windows") per eligible participant
+ema_complete_all <- base_data_full %>%
+  filter(
+    StudyID %in% eligible_ids,
+    !is.na(pain_increasing),
+    !is.na(overall_pain_lag2),
+    !is.na(catastrophize_lag1), !is.na(catastrophize_lag2),
+    !is.na(depress_lag1),       !is.na(depress_lag2),
+    !is.na(interference_lag1),  !is.na(interference_lag2),
+    !is.na(ema_missing_lag1)
+  )
+
+windows_per_participant <- ema_complete_all %>%
+  count(StudyID, name = "N_Windows")
+
+cat("\nData windows (rows) per participant (N =", nrow(windows_per_participant), "):\n")
+cat("  Mean:  ", round(mean(windows_per_participant$N_Windows), 1), "\n")
+cat("  SD:    ", round(sd(windows_per_participant$N_Windows), 1), "\n")
+cat("  Median:", median(windows_per_participant$N_Windows), "\n")
+cat("  Range: ", min(windows_per_participant$N_Windows), "-",
+    max(windows_per_participant$N_Windows), "\n")
+
+print(windows_per_participant %>% arrange(N_Windows))
