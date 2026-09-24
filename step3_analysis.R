@@ -46,6 +46,14 @@ analyses <- list(
 # 2 - UTILITY FUNCTIONS
 ###############################################################################
 
+# Saves a plot as both PNG (for quick viewing) and TIFF (for publication
+# submission), at the same publication-scaled dimensions and dpi = 300.
+save_fig <- function(path_no_ext, plot, width, height, dpi = 300) {
+  ggsave(paste0(path_no_ext, ".png"),  plot = plot, width = width, height = height, dpi = dpi)
+  ggsave(paste0(path_no_ext, ".tiff"), plot = plot, width = width, height = height, dpi = dpi,
+         compression = "lzw")
+}
+
 format_decimal <- function(x, digits = 3) {
   xr <- round(x, digits)
   xc <- as.character(xr)
@@ -311,24 +319,26 @@ colors <- c("Random Forest"      = "#2A363B",
     labs(x = paste0("Pooled ROC AUC (", label, ")"), y = "") +
     theme_minimal() +
     theme(axis.ticks = element_blank(), legend.position = "none",
-          axis.text = element_text(size = 14), axis.title.x = element_text(size = 16)) +
+          axis.text = element_text(size = 6), axis.title.x = element_text(size = 6)) +
     scale_x_continuous(limits = c(0,1), breaks = seq(0,1,.25),
                        labels = format_decimal(seq(0,1,.25)))
-  
+
   p_dot <- ggplot(filt_ord, aes(x = AUC, y = fct_reorder(StudyID, Best_AUC),
                                 color = Model)) +
-    geom_point(size = 2.5, alpha = 0.8) +
+    geom_point(size = .2, alpha = 0.8) +
     scale_color_manual(values = colors) +
-    geom_vline(xintercept = 0.5,  linetype = "dashed", alpha = 0.7) +
+    geom_vline(xintercept = 0.5,  linetype = "dashed", alpha = 0.5, linewidth=0.25) +
     labs(x = paste0("Pooled ROC AUC (", label, ")"),
          y = "Participants (ranked by best performance)", color = NULL) +
     theme_minimal() +
     theme(panel.grid = element_blank(), axis.ticks = element_blank(),
-          axis.text.y = element_blank(), axis.text.x = element_text(size = 14),
-          axis.title = element_text(size = 16), legend.text = element_text(size = 14)) +
+          axis.text.y = element_blank(), axis.text.x = element_text(size = 6),
+          axis.title = element_text(size = 6), legend.text = element_text(size = 6),
+          legend.key.size = unit(0.4, "cm"), legend.key.spacing = unit(0.2, "cm"),
+          legend.key.spacing.y = unit(0.01, "cm")) +
     scale_x_continuous(limits = c(0,1), breaks = seq(0,1,.25),
                        labels = format_decimal(seq(0,1,.25)))
-  
+
   freq <- best %>% count(Best_Model) %>% mutate(Pct = round(n / sum(n) * 100, 1))
   p_freq <- ggplot(freq, aes(x = n, y = reorder(Best_Model, n), fill = Best_Model)) +
     geom_bar(stat = "identity", alpha = 0.8) +
@@ -336,11 +346,11 @@ colors <- c("Random Forest"      = "#2A363B",
     labs(x = paste0("Number of Participants (", label, ")"), y = "") +
     theme_minimal() +
     theme(legend.position = "none", panel.grid = element_blank(),
-          axis.text = element_text(size = 14), axis.title.x = element_text(size = 16),
-          plot.margin = unit(c(1,2,.5,.5), "cm")) +
-    geom_text(aes(label = n), hjust = 1.2, size = 4, color = "white", fontface = "bold") +
+          axis.text = element_text(size = 6), axis.title.x = element_text(size = 6),
+          plot.margin = unit(c(.25,.8,.25,.5), "cm")) +
+    geom_text(aes(label = n), hjust = 1.2, size = 5 / .pt, color = "white", fontface = "bold") +
     geom_text(aes(label = paste0("(", format_decimal(Pct), "%)")),
-              hjust = -0.1, size = 4, color = "black", fontface = "bold") +
+              hjust = -0.1, size = 5 / .pt, color = "black", fontface = "bold") +
     scale_x_continuous(expand = expansion(mult = c(0, .2))) + coord_cartesian(clip = "off")
   
   list(p_dot = p_dot, p_freq = p_freq, p_ridge = p_ridge)
@@ -362,7 +372,7 @@ for (i in seq_along(af)) {
     pp <- .build_three_plots(sm, af[[i]]$label)
     pp$p_dot <- pp$p_dot +
       annotation_custom(grid::textGrob(LETTERS[i], x = .02, y = .98, hjust = 0, vjust = 1,
-                                       gp = grid::gpar(fontsize = 18, fontface = "bold")))
+                                       gp = grid::gpar(fontsize = 7, fontface = "bold")))
     plots[[af[[i]]$name]] <- pp
   }
 }
@@ -371,17 +381,21 @@ if (length(plots) > 0) {
   p_dots <- wrap_plots(lapply(af, function(a) plots[[a$name]]$p_dot),
                        ncol = length(af)) +
     plot_layout(guides = "collect") &
-    theme(text = element_text(family = "Arial"), legend.position = "right")
-  ggsave(file.path(analysis_output_dir, "combined_participant_plots.png"),
-         plot = p_dots, width = 18, height = 9, dpi = 300)
-  
+    theme(text = element_text(family = "Arial"),
+          legend.position = "right",
+          legend.key.size = unit(0.4, "cm"),
+          legend.key.spacing = unit(0.2, "cm"),
+          legend.key.spacing.y = unit(0.01, "cm"))
+  save_fig(file.path(analysis_output_dir, "combined_participant_plots"),
+           plot = p_dots, width = 7, height = 3)
+
   p_freqs <- wrap_plots(lapply(af, function(a) plots[[a$name]]$p_freq),
                         ncol = length(af)) &
     theme(text = element_text(family = "Arial"),
-          plot.margin = unit(c(1,2,.5,.5), "cm"))
-  ggsave(file.path(analysis_output_dir, "combined_frequency_plots.png"),
-         plot = p_freqs, width = 22, height = 6, dpi = 300)
-  cat("  Saved: combined_participant_plots.png, combined_frequency_plots.png\n")
+          plot.margin = unit(c(.25,.9,.25,.1), "cm"))
+  save_fig(file.path(analysis_output_dir, "combined_frequency_plots"),
+           plot = p_freqs, width = 6, height = 2.5)
+  cat("  Saved: combined_participant_plots.png/.tiff, combined_frequency_plots.png/.tiff\n")
 }
 
 a4    <- Filter(function(a) a$name == "A4_Lag1PainOnly", analyses)[[1]]
@@ -396,15 +410,15 @@ if (!is.null(sm_a4) && nrow(sm_a4) > 0) {
                              pp$p_dot$layers)
   # Reference line for the null-model comparison (mean AUC = 0.557)
   pp$p_dot <- pp$p_dot +
-    geom_vline(xintercept = 0.557, linetype = "dashed", color = "grey40", alpha = 0.8)
+    geom_vline(xintercept = 0.557, linetype = "dashed", color = "grey40", alpha = 0.8, linewidth=0.25)
   p_a4 <- ((pp$p_dot + pp$p_freq + plot_layout(widths = c(2,1))) &
              theme(text = element_text(family = "Arial"))) +
     plot_annotation(tag_levels = "A") &
-    theme(plot.tag = element_text(size = 22, face = "bold"),
+    theme(plot.tag = element_text(size = 7, face = "bold"),
           plot.tag.position = c(0, 1))
-  ggsave(file.path(analysis_output_dir, "Lag1PainOnly_combined_grid.png"),
-         plot = p_a4, width = 18, height = 8, dpi = 300)
-  cat("  Saved: Lag1PainOnly_combined_grid.png\n")
+  save_fig(file.path(analysis_output_dir, "Lag1PainOnly_combined_grid"),
+           plot = p_a4, width = 7, height = 3)
+  cat("  Saved: Lag1PainOnly_combined_grid.png/.tiff\n")
 }
 
 ###############################################################################
@@ -430,22 +444,22 @@ for (i in seq_along(af_imp)) {
       geom_bar(stat = "identity", fill = mc_colors[i], alpha = 0.8) +
       labs(x = paste0("Percentage (", af_imp[[i]]$label, ")"), y = "") +
       theme_minimal() +
-      theme(panel.grid = element_blank(), axis.text = element_text(size = 14),
-            axis.title.x = element_text(size = 16),
+      theme(panel.grid = element_blank(), axis.text = element_text(size = 6),
+            axis.title.x = element_text(size = 6),
             plot.margin = unit(c(1,1,.5,.5), "cm")) +
       annotation_custom(grid::textGrob(LETTERS[letter_idx], x = -.08, y = 1.02,
                                        hjust = 0, vjust = 0,
-                                       gp = grid::gpar(fontsize = 18, fontface = "bold"))) +
+                                       gp = grid::gpar(fontsize = 7, fontface = "bold"))) +
       coord_cartesian(clip = "off")
   }
 }
 
 if (length(plist) > 0) {
   p_imp_combined <- wrap_plots(plist, ncol = length(plist)) &
-    theme(plot.margin = unit(c(1,1,.5,.5), "cm"))
-  ggsave(file.path(analysis_output_dir, "combined_feature_importance.png"),
-         plot = p_imp_combined, width = 21, height = 6, dpi = 300)
-  cat("  Saved: combined_feature_importance.png\n")
+    theme(plot.margin = unit(c(.3,.25,.25,.25), "cm"))
+  save_fig(file.path(analysis_output_dir, "combined_feature_importance"),
+           plot = p_imp_combined, width = 8, height = 2)
+  cat("  Saved: combined_feature_importance.png/.tiff\n")
 }
 
 
