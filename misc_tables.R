@@ -19,8 +19,7 @@ library(tableone)
 # 0 - CONFIGURATION
 ################################################################################
 
-data_dir <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Data"
-output_dir <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
+source("paths_local.R")
 
 demographics_path <- file.path(data_dir, "redcap_demographics_all.csv")
 ema_source_path <- file.path(data_dir, "allEMAdata-v5.csv")
@@ -117,7 +116,7 @@ df_expanded <- read_csv(expanded_path, show_col_types = FALSE) %>%
 df_ema <- read_csv(ema_lookup_path, show_col_types = FALSE) %>%
   mutate(time_block = as.POSIXct(time_block, tz = "UTC"))
 
-# Match the modeling eligibility logic so missingness is summarized on the same sample.
+# Applies the same eligibility filter used in the modeling pipeline.
 base_data <- df_ema %>%
   group_by(StudyID) %>%
   arrange(time_block) %>%
@@ -187,7 +186,7 @@ sensor_dt <- as.data.table(df_expanded)[
 ]
 window_dt <- as.data.table(ema_windows)
 
-# Compute 1-hour pre-EMA sensor-window missingness using the same windowing scheme as step 2.
+# Compute 1-hour pre-EMA sensor-window missingness.
 matched <- sensor_dt[
   window_dt,
   on = .(StudyID, time_block > window_start, time_block <= window_end),
@@ -251,14 +250,12 @@ print(predictor_missingness_table)
 # 3 - REPLICATE STEP 2'S BASE_DATA + DATA WINDOWS PER PARTICIPANT
 ################################################################################
 
-# Derive a new df from the existing base_data, adding the remaining lag
-# columns 
+# Adds the remaining EMA lag columns to base_data.
 base_data_full <- base_data %>%
   group_by(StudyID) %>%
   arrange(time_block) %>%
   mutate(
     days_since_first_ema = as.numeric(difftime(functional_date, min(functional_date), units = "days")),
-    # Compute EMA lags before filtering so gaps do not reset the sequence.
     overall_pain_lag2   = lag(overall_pain,  2),
     catastrophize_lag1  = lag(catastrophize, 1),
     catastrophize_lag2  = lag(catastrophize, 2),

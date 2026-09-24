@@ -16,7 +16,8 @@ library(dplyr)
 # 0 - CONFIGURATION
 ################################################################################
 
-pipeline_dir <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
+source("paths_local.R")
+pipeline_dir <- output_dir
 reference_min <- "74ValidWindows"
 auc_summary_min <- "26ValidWindows"
 
@@ -39,7 +40,6 @@ get_en_col <- function(sm) {
 }
 
 # Parse "[lo, hi]" strings into numeric, flag [NA,NA] / [0,1] / [1,1] as degenerate
-# (mirrors step3_analysis-v2.R section 3b)
 parse_ci <- function(x) suppressWarnings(as.numeric(strsplit(gsub("\\[|\\]", "", x), ",\\s*")[[1]]))
 is_bad   <- function(ci) (is.na(ci[1]) && is.na(ci[2])) || isTRUE(all.equal(ci, c(0,1))) || isTRUE(all.equal(ci, c(1,1)))
 
@@ -47,7 +47,7 @@ is_bad   <- function(ci) (is.na(ci[1]) && is.na(ci[2])) || isTRUE(all.equal(ci, 
 # folder, null out any model whose own CI is degenerate, and return the
 # StudyIDs to drop globally for that folder: participants with zero usable
 # models in ANY config, or with only a single held-out observation in ANY
-# config (mirrors step3_analysis-v2.R section 3b).
+# config.
 compute_drop_ids <- function(folder, analyses) {
   all_summaries <- list()
   for (an in analyses) {

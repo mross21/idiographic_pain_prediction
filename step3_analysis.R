@@ -27,7 +27,7 @@ for (p in pkgs) {
 # 1 - PATHS
 ###############################################################################
 
-output_dir     <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
+source("paths_local.R")
 hr_window_min  <- 26   # must match the value used in step2_imputation_and_modeling.R
 analysis_label <- paste0(hr_window_min, "ValidWindows")
 
@@ -202,7 +202,7 @@ drop_ids_degenerate <- unique(unlist(lapply(names(all_summaries), function(an) {
 # config (global)
 drop_ids_single_obs <- unique(unlist(lapply(names(all_summaries), function(an) {
   sm <- all_summaries[[an]]
-  # remove participants with only one fold (now also filtered out in step2)
+  # remove participants with only one fold
   sm$StudyID[sm$NumObservations == 1]
 })))
 
@@ -595,13 +595,12 @@ cat("\nAll outputs written to:", analysis_output_dir, "\n")
 
 
 ###############################################################################
-# 11 - A4 LAG-1 PAIN LR COEFFICIENT SIGN (reviewer response)
+# 11 - A4 LAG-1 PAIN LR COEFFICIENT SIGN
 ###############################################################################
 #
-#   Reports the sign/magnitude of the A4_Lag1PainOnly LR coefficient on
-#   overall_pain_lag1 for every participant, regardless of whether LR was
-#   their best-performing model. Reads the coefficient already fit and saved
-#   by build_a4_result_row() in step2.
+#   Reports the sign and magnitude of each participant's A4_Lag1PainOnly LR
+#   coefficient on overall_pain_lag1, using the value already computed by
+#   build_a4_result_row() in step2.
 #
 ###############################################################################
 
@@ -646,12 +645,10 @@ if (is.null(sm_a4_lr) || !("Lag1Pain_LR_Estimate" %in% names(sm_a4_lr))) {
 #   Best_AUC and each of the four individual model AUCs:
 #     - Individual: each person's real value vs. their own null distribution
 #       (mean/SD/CI), with an empirical one-sided p-value (proportion of that
-#       person's own null draws >= their real value, +1/+1 correction so p
-#       is never exactly 0).
+#       person's own null draws >= their real value).
 #     - Group: consolidate each person's null distribution to their own null
 #       mean first, then compare the group's real average against the group
-#       average of those null means via a paired t-test, matching Section 8's
-#       group-level comparisons.
+#       average of those null means via a paired t-test.
 #
 ###############################################################################
 

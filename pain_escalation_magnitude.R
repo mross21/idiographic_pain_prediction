@@ -21,10 +21,10 @@ library(dplyr)
 
 ## ---- 1. Paths -----------------------------------------------------------
 
-output_dir      <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
+source("paths_local.R")
 ema_lookup_path <- file.path(output_dir, "df_ema.csv")
 
-script_dir = "/Users/f0085f6/Documents/GitHub/idiographic_pain_prediction"
+script_dir <- mice_reuse_path
 eligible_ids_path <- file.path(script_dir, "eligible_ids_local.R")
 if (!file.exists(eligible_ids_path)) {
   stop("eligible_ids_local.R not found at: ", eligible_ids_path,

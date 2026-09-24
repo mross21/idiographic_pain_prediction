@@ -1,0 +1,13 @@
+################################################################################
+#
+# Local paths configuration TEMPLATE
+#
+#   Copy this file to `paths_local.R` (same folder) and set the paths below
+#   for your machine. `paths_local.R` is gitignored and is sourced by every
+#   pipeline script.
+#
+################################################################################
+
+data_dir        <- "/path/to/data"
+output_dir      <- "/path/to/outputs"
+mice_reuse_path <- "/path/to/repo/"   # repo root (contains mice.reuse.R)

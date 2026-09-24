@@ -28,8 +28,7 @@ library(lubridate)
 # 0 - CONFIGURATION
 ################################################################################
 
-data_dir   <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Data"
-output_dir <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
+source("paths_local.R")
 report_dir <- file.path(output_dir, "reports")
 
 for (d in c(output_dir, report_dir)) {
@@ -305,14 +304,11 @@ cat("\n[2/5] Adding time descriptors...\n")
 
 df_time_desc <- df_raw %>%
   mutate(
-    # recompute hour/minute from time_block to ensure consistency after grid
-    # expansion (the raw 'hour' column is already present but we recompute
-    # to stay consistent with values derived from time_block in the grid below)
+    # Recompute hour/minute from time_block.
     hour            = hour(time_block),
     minute          = minute(time_block),
-    # functional_date: observations before study_day_cutoff_hour are attributed
-    # to the previous calendar date - late-night responses belong to the prior
-    # study day. day_of_week and is_weekend are derived from functional_date.
+    # functional_date shifts time_block back by the cutoff hour so pre-cutoff
+    # rows belong to the previous study day.
     functional_date = as.Date(time_block - hours(study_day_cutoff_hour)),
     time_of_day     = case_when(
       hour >= 5  & hour < 12 ~ "Morning",
@@ -388,9 +384,8 @@ df_expanded <- full_grid %>%
     date            = as.Date(time_block),
     hour            = hour(time_block),
     minute          = minute(time_block),
-    # functional_date: shift back by cutoff hours so pre-3am rows belong to
-    # the previous study day. day, day_of_week, and is_weekend all follow
-    # functional_date so downstream grouping is study-day-consistent.
+    # functional_date shifts time_block back by the cutoff hour so pre-cutoff
+    # rows belong to the previous study day.
     functional_date = as.Date(time_block - hours(study_day_cutoff_hour)),
     day             = as.integer(functional_date - min(functional_date, na.rm = TRUE)),
     time_of_day     = case_when(
@@ -402,9 +397,8 @@ df_expanded <- full_grid %>%
     day_of_week = weekdays(functional_date),
     is_weekend  = day_of_week %in% c("Saturday", "Sunday")
   ) %>%
-  # broadcast any observed sleep value across all rows in the same
-  # participant study-day before computing the missing flag.
-  # Uses functional_date so late-night rows are grouped with the correct day.
+  # Broadcasts the observed sleep value across all rows in the same
+  # participant study-day.
   group_by(StudyID, functional_date) %>%
   mutate(
     totalMinutesAsleep = ifelse(
@@ -526,8 +520,7 @@ cat("\n  Final EMA lookup rows:", nrow(df_ema),
 # -- 9e: duplicate EMA filter ------------------------------------------------------
 # When two completed surveys fall within 1 hour of each other for the same
 # participant, the second (later) one is removed. The check is performed only
-# on responded rows (!is.na(overall_pain)) so missed notifications do not
-# reset the 1-hour window.
+# on responded rows (!is.na(overall_pain)).
 cat("\n  Filtering duplicate EMA responses within 1-hour windows...\n")
 
 responded_rows <- df_ema %>%

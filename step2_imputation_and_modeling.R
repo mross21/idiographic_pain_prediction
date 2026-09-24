@@ -10,6 +10,7 @@
 #   analysis configuration.
 #
 # Run after step1_create_datasets.R. Requires df_expanded.csv and df_ema.csv.
+#
 ################################################################################
 
 
@@ -24,7 +25,7 @@ for (p in pkgs) {
   library(p, character.only = TRUE)
 }
 
-mice_reuse_path <- "/Users/f0085f6/Documents/GitHub/idiographic_pain_prediction/"
+source("paths_local.R")
 # mice.reuse is sourced locally
 source(file.path(mice_reuse_path, "mice.reuse.R"))
 
@@ -33,7 +34,6 @@ source(file.path(mice_reuse_path, "mice.reuse.R"))
 # 1 - PATHS + LOAD DATA
 ###############################################################################
 
-output_dir     <- "/Users/f0085f6/Desktop/Frumkin_lab/personalizedPainPrediction_paper/PPP_Project/Output/pipeline/simple_pain_outcome"
 fold_cache_dir <- file.path(output_dir, "folds")    # shared fold cache across threshold variants
 results_dir    <- file.path(output_dir, "results")  # shared participant results across threshold variants
 
@@ -115,8 +115,7 @@ analyses <- list(
   list(name  = "A3_Combined",
        vars  = c(fitbit_vars, lag_ema_vars, context_vars),
        label = "Fitbit + Lag EMA + Context")
-  # A4_Lag1PainOnly / A4_NullModel are handled in Section 4B since the predictor
-  # overall_pain_lag1 is not imputed.
+  # A4_Lag1PainOnly / A4_NullModel are handled separately in Section 4B.
 )
 
 if (!dir.exists(analysis_output_dir))
@@ -188,8 +187,7 @@ pool_auc_rubins <- function(aucs, ses) {
   SE_Z <- ses / (aucs * (1 - aucs))
   Z_bar <- mean(Z)
   W     <- mean(SE_Z^2)
-  # m == 1: a single estimate, no between-estimate variance to add — total 
-  # variance is just the within-estimate term (For A4 configuration).
+  # m == 1: no between-estimate variance term.
   B     <- if (m > 1) var(Z) else 0
   T_var <- W + (1 + 1/m) * B
   SE    <- sqrt(T_var)
@@ -1108,7 +1106,6 @@ base_data <- df_ema %>%
         pain_flag == 1L  ~ "Yes",
         TRUE             ~ "No"
       ), levels = c("No","Yes")),
-    # Compute EMA lags before filtering so gaps do not reset the sequence.
     overall_pain_lag2    = lag(overall_pain,    2),
     catastrophize_lag1   = lag(catastrophize,   1),
     catastrophize_lag2   = lag(catastrophize,   2),

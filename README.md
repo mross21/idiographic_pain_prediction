@@ -4,7 +4,7 @@ This repository contains an R pipeline for building participant-specific models 
 
 ## Repository contents
 
-- `install_packages.R`: installs the R packages used by the current codebase using the versions listed in the script
+- `install_packages.R`: installs the R packages used by the codebase, at the versions listed in the script
 - `misc_tables.R`: produces supplemental participant demographics and predictor missingness tables for the model-eligible sample
 - `mice.reuse.R`: local helper sourced by the modeling pipeline for reusing trained MICE imputations
 - `sensitivity_analysis_data_window_minimum.R`: summarizes sensitivity analyses across valid-window minimum settings
@@ -51,7 +51,7 @@ The scripts are organized as a sequential workflow:
 
 ## Modeling target
 
-The current modeling script treats the outcome as a simple future pain escalation indicator:
+The modeling script treats the outcome as a binary future pain escalation indicator:
 
 - `Yes`: pain at the current EMA is greater than pain at the previous EMA
 - `No`: pain does not increase
@@ -65,6 +65,27 @@ Before running the pipeline, install the required R packages with:
 ```r
 source("install_packages.R")
 ```
+
+### Local configuration (required before running any script)
+
+The data/output folder locations are machine-specific and are **not** committed to this
+repository. Every script sources a local, gitignored `paths_local.R` file (from the repo
+root) instead of hardcoding these paths.
+
+To reproduce the pipeline on your own machine:
+
+1. Copy the template: `cp paths_local.R.example paths_local.R`
+2. Edit `paths_local.R` and set the three paths for your machine:
+   - `data_dir` — folder containing the raw input data (e.g. `redcap_demographics_all.csv`, `allEMAdata-v5.csv`)
+   - `output_dir` — folder where pipeline outputs are written/read (`df_expanded.csv`, `df_ema.csv`, per-participant results, figures, etc.)
+   - `mice_reuse_path` — this repo's root folder (contains `mice.reuse.R`)
+
+`paths_local.R` is listed in `.gitignore` and should never be committed.
+
+Similarly, `misc_tables.R` and `pain_escalation_magnitude.R` source a local
+`eligible_ids_local.R` file (also gitignored) that defines the vector of model-eligible
+`StudyID`s used for those supplemental tables — create this file the same way (a script
+defining `eligible_ids <- c(...)`) before running either of them.
 
 The intended run order is:
 
