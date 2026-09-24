@@ -80,8 +80,6 @@ To reproduce the pipeline on your own machine:
    - `output_dir` — folder where pipeline outputs are written/read (`df_expanded.csv`, `df_ema.csv`, per-participant results, figures, etc.)
    - `mice_reuse_path` — this repo's root folder (contains `mice.reuse.R`)
 
-`paths_local.R` is listed in `.gitignore` and should never be committed.
-
 Similarly, `misc_tables.R` and `pain_escalation_magnitude.R` source a local
 `eligible_ids_local.R` file (also gitignored) that defines the vector of model-eligible
 `StudyID`s used for those supplemental tables — create this file the same way (a script
